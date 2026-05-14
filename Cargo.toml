@@ -1,0 +1,8 @@
+[package]
+name = "rust-box"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tray-icon="0.24.0"
+tokio="1.52.3"
