@@ -3,6 +3,8 @@
 debug
 target
 
+.idea
+
 # test cfg
 test.cfg
 
