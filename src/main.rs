@@ -1,34 +1,14 @@
-
-use tokio::io::AsyncReadExt;
-use tray_icon::{TrayIconBuilder, menu::Menu, Icon};
-
-// fn main() {
-//     let icon = Icon::from_rgba(vec![255; 64 * 64 * 4], 64, 64).expect("Failed to create icon");
-//
-//
-//     let tray_menu = Menu::new();
-//     let tray_icon = TrayIconBuilder::new()
-//         .with_menu(Box::new(tray_menu))
-//         .with_tooltip("system-tray - tray icon library!")
-//         .with_icon(icon)
-//         .build()
-//         .unwrap();
-//
-//     loop {
-//         std::thread::sleep(std::time::Duration::from_millis(100));
-//     }
-// }
-
 mod config;
 mod build;
 
+use tokio::io::AsyncReadExt;
+use tray_icon::{TrayIconBuilder, menu::Menu, Icon};
 use std::{env, process};
-use sysinfo::{Pid, System};
-use std::io::Error;
+use std::io::Cursor;
 use tokio::process::Command;
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
-use std::process::Stdio;
+use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
 use std::time::Duration;
+use image::ImageReader;
 use processkit::ProcessGroup;
 use tokio::time::sleep;
 use crate::config::Config;
@@ -38,6 +18,34 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    // include_bytes! встраивает файл иконки прямо в бинарник.
+    // Путь указан относительно корня вашего крейта (там, где лежит Cargo.toml).
+    let png_bytes : &'static [u8] = include_bytes!("../rust-box.png");
+
+    // Декодируем PNG в RGBA
+    let img = ImageReader::new(Cursor::new(png_bytes))
+        .with_guessed_format()
+        .expect("Не удалось определить формат")
+        .decode()
+        .expect("Не удалось декодировать PNG")
+        .into_rgba8();  // конвертируем в RGBA8
+
+    let (width, height) = img.dimensions();
+    let rgba_data = img.into_raw();
+
+    // Создаём иконку
+    let icon = tray_icon::Icon::from_rgba(rgba_data, width, height)
+        .expect("Не удалось создать иконку из RGBA-данных");
+
+    let tray_menu = Menu::new();
+        let tray_icon = TrayIconBuilder::new()
+            .with_menu(Box::new(tray_menu))
+            .with_tooltip("system-tray - tray icon library!")
+            .with_icon(icon)
+            .build()
+            .unwrap();
+
 
     let config = Config::build(env::args()).unwrap_or_else(|err| {
         eprintln!("Problem parsing arguments: {err}");
@@ -91,8 +99,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(1);
     });
 
-    println!("{}", &pid);
-
     // В цикле
     loop {
         let status = Command::new("tasklist")
@@ -101,8 +107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         let stdout = String::from_utf8_lossy(&status.stdout);
         if !stdout.contains(&pid.to_string()) {
+            println!("{}", &stdout);
             break; // процесс завершился
         }
+
         sleep(Duration::from_secs(1)).await;
     }
 

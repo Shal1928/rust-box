@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tray-icon="0.24.0"
+tray-icon={ version = "0.24.0", default-features = true}
+image = { version = "0.25", features = ["png", "ico"] }
 tokio={ version = "1.52.3", features = ["full", "process"] }
-sysinfo = "0.30"
 winres = "0.1.12"
 processkit = "0.5"
