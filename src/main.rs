@@ -1,154 +1,157 @@
+// main.rs
 mod config;
-mod build;
+
+use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::Cursor;
+use std::time::Duration;
 
 use tray_icon::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
-    MouseButton, TrayIconBuilder, TrayIconEvent};
-use tokio::io::AsyncReadExt;
-use std::{env, process, thread};
-use std::io::Cursor;
-use tokio::process::Command;
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
-use std::time::Duration;
+    menu::{Menu, MenuItem, PredefinedMenuItem, MenuEvent},
+    TrayIconBuilder, TrayIconEvent,
+};
+use winit::event_loop::{EventLoop, ControlFlow, EventLoopWindowTarget};
+use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use image::ImageReader;
-use processkit::ProcessGroup;
+use sysinfo::System;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+
 use crate::config::Config;
 
-// Константа для скрытия окна
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+enum ChildCommand {
+    Start,
+    Stop,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-    let config = Config::build(env::args()).unwrap_or_else(|err| {
-        eprintln!("Problem parsing arguments: {err}");
+    let config = Config::build(std::env::args()).unwrap_or_else(|err| {
+        eprintln!("Config error: {err}");
         process::exit(1);
     });
 
-    let app_path = &config.app_path.unwrap();
+    let app_path = config.app_path.as_ref().unwrap().clone();
+    let cfg_path = config.cfg_path.as_ref().unwrap().clone();
 
-    // include_bytes! встраивает файл иконки прямо в бинарник.
-    // Путь указан относительно корня вашего крейта (там, где лежит Cargo.toml).
-    let png_bytes : &'static [u8] = include_bytes!("../rust-box.png");
-
-    // Декодируем PNG в RGBA
-    let img = ImageReader::new(Cursor::new(png_bytes))
-        .with_guessed_format()
-        .expect("Не удалось определить формат")
-        .decode()
-        .expect("Не удалось декодировать PNG")
-        .into_rgba8();  // конвертируем в RGBA8
-
+    let icon_bytes = include_bytes!("../rust-box.png");
+    let img = ImageReader::new(Cursor::new(icon_bytes))
+        .with_guessed_format()?
+        .decode()?
+        .into_rgba8();
     let (width, height) = img.dimensions();
-    let rgba_data = img.into_raw();
+    let icon = tray_icon::Icon::from_rgba(img.into_raw(), width, height)?;
 
-    // Создаём иконку
-    let icon = tray_icon::Icon::from_rgba(rgba_data, width, height)
-        .expect("Не удалось создать иконку из RGBA-данных");
+    let is_running = Arc::new(AtomicBool::new(false));
 
-    // Состояние переключателя
-    let mut is_on = true;
-
-    let toggle_item = MenuItem::new("Off", true, None);
+    let toggle_item = MenuItem::new("Start", true, None);
     let quit_item = MenuItem::new("Exit", true, None);
-
-    let tray_menu = Menu::new();
-    tray_menu.append(&toggle_item).unwrap();
-    tray_menu.append(&PredefinedMenuItem::separator()).unwrap();
-    tray_menu.append(&quit_item).unwrap();
-
-    // Запоминаем id пунктов (они клонируются, т.к. MenuId внутри Rc, но сам id можно сравнить)
     let toggle_id = toggle_item.id().clone();
     let quit_id = quit_item.id().clone();
 
+    let menu = Menu::new();
+    menu.append(&toggle_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&quit_item)?;
+
     let tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip(format!("rust-box for {}", &app_path))
+        .with_menu(Box::new(menu))
+        .with_tooltip("Rust Box")
         .with_icon(icon)
-        .build()
-        .unwrap();
+        .build()?;
 
-    // PowerShell скрипт для запуска от администратора без окна
-    let ps_script = format!(
-        r#"$p = Start-Process -FilePath "{}" -ArgumentList "run","-c","{}" -Verb RunAs -WindowStyle Hidden -PassThru -Wait; if ($p) {{ $p.Id }} else {{ exit 1 }}"#,
-        &app_path,
-        &config.cfg_path.clone().unwrap()
-    );
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ChildCommand>();
 
-    // 1. Сначала запускаем процесс стандартным способом, со всеми нужными флагами
-    let mut child = tokio::process::Command::new("powershell")
-        .args(&["-Command", &ps_script])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW) // ваш флаг остаётся
-        .spawn()?;
+    let tray_event_rx = TrayIconEvent::receiver();
+    let menu_event_rx = MenuEvent::receiver();
 
-    // 2. Создаём группу и усыновляем уже запущенный процесс
-    let group = ProcessGroup::new()?;
-    group.adopt(&mut child)?;
+    let cmd_tx_clone = cmd_tx.clone();
+    let app_path_clone = app_path;
+    let cfg_path_clone = cfg_path;
 
-    // Читаем PID
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut stdout).await?;
-    }
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        err.read_to_string(&mut stderr).await?;
-    }
+    let manager_handle = tokio::spawn(async move {
+        let mut child_handle: Option<tokio::process::Child> = None;
 
-    println!("stdout: '{}'", stdout);
-    println!("stderr: '{}'", stderr);
-
-    let pid_str = stdout.trim();
-    if pid_str.is_empty() {
-        eprintln!("❌ Can't get PID!");
-        process::exit(1);
-    }
-
-    let pid = pid_str.parse::<u32>().map_err(|e| {
-        format!("Parse error PID '{}': {}", pid_str, e)
-    }).unwrap_or_else(|err| {
-        eprintln!("❌ {}", err);
-        process::exit(1);
-    });
-
-    let event_receiver = TrayIconEvent::receiver();
-
-    // В цикле
-    loop {
-        // Проверяем, нет ли новых событий от иконки в трее.
-        while let Ok(event) = event_receiver.try_recv() {
-            println!("menu event");
-            match event {
-                // Обрабатываем обычный клик.
-                TrayIconEvent::Click { button, .. } => {
-                    if let MouseButton::Left = button {
-                        tray_icon.show_menu(); // <- просто вызываем, без if let Err
+        loop {
+            tokio::select! {
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        ChildCommand::Start => {
+                            if child_handle.is_none() {
+                                let ps_script = format!(
+                                    r#"Start-Process -FilePath "{}" -ArgumentList "run","-c","{}" -Verb RunAs -WindowStyle Hidden -Wait"#,
+                                    app_path_clone, cfg_path_clone
+                                );
+                                if let Ok(child) = Command::new("powershell")
+                                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
+                                    .creation_flags(CREATE_NO_WINDOW)
+                                    .spawn()
+                                {
+                                    child_handle = Some(child);
+                                }
+                            }
+                        }
+                        ChildCommand::Stop => {
+                            if let Some(mut child) = child_handle.take() {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                            }
+                        }
                     }
                 }
-                // Обрабатываем двойной клик, если нужно.
-                TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
-                    println!("Двойной клик левой кнопкой");
-                    // Например: сразу запустить/остановить VPN.
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    if let Some(child) = &child_handle {
+                        let sys = System::new_all();
+                        let still_running = sys.processes()
+                            .values()
+                            .any(|p| p.pid().as_u32() == child.id().unwrap_or(0));
+                        if !still_running {
+                            child_handle = None;
+                            let _ = cmd_tx_clone.send(ChildCommand::Stop);
+                        }
+                    }
                 }
-                // Игнорируем другие события.
-                _ => {}
+            }
+        }
+    });
+
+    let mut event_loop = EventLoop::new()?;
+
+    // Correct closure signature: (Event<()>, &EventLoopWindowTarget<()>)
+    event_loop.run_on_demand(move |_event, window_target| {
+        // Set control flow via window_target
+        window_target.set_control_flow(ControlFlow::Wait);
+
+        while let Ok(menu_event) = menu_event_rx.try_recv() {
+            if menu_event.id == toggle_id {
+                let current = is_running.load(Ordering::SeqCst);
+                if !current {
+                    let _ = cmd_tx.send(ChildCommand::Start);
+                    is_running.store(true, Ordering::SeqCst);
+                    let _ = toggle_item.set_text("Stop");
+                } else {
+                    let _ = cmd_tx.send(ChildCommand::Stop);
+                    is_running.store(false, Ordering::SeqCst);
+                    let _ = toggle_item.set_text("Start");
+                }
+            } else if menu_event.id == quit_id {
+                let _ = cmd_tx.send(ChildCommand::Stop);
+                window_target.exit();
             }
         }
 
-        let status = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .output()
-            .await?;
-        let stdout = String::from_utf8_lossy(&status.stdout);
-        if !stdout.contains(&pid.to_string()) {
-            println!("{}", &stdout);
-            break; // процесс завершился
+        while let Ok(tray_event) = tray_event_rx.try_recv() {
+            if let TrayIconEvent::Click { button, .. } = tray_event {
+                if button == tray_icon::MouseButton::Left {
+                    let _ = tray_icon.show_menu();
+                }
+            }
         }
+    })?;
 
-        thread::sleep(Duration::from_millis(50));
-    }
-
+    manager_handle.abort();
     Ok(())
 }
