@@ -10,3 +10,5 @@ tokio = { version = "1.52", features = ["full", "process"] }
 winres = "0.1"
 sysinfo = "0.35"
 winit = "0.29"
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winnt", "jobapi2", "handleapi", "processthreadsapi"] }
