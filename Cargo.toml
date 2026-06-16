@@ -1,7 +1,7 @@
 [package]
 name = "rust-box"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 tray-icon = "0.24.0"
@@ -10,3 +10,6 @@ tokio = { version = "1.52", features = ["full", "process"] }
 winit = "0.29"
 sysinfo = "0.35"
 processkit = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "winnt", "handleapi", "processthreadsapi", "synchapi", "jobapi2", "minwindef", "ntdef"] }
