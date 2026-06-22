@@ -152,14 +152,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_path = config.app_path.as_ref().unwrap().clone();
     let cfg_path = config.cfg_path.as_ref().unwrap().clone();
 
-    let app_name = Path::new(&app_path)
-        .file_name()
+    let file_stem = Path::new(&app_path)
+        .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    let app_stem = Path::new(&app_path)
-        .file_stem()
+    let app_name = Path::new(&app_path)
+        .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
@@ -210,17 +210,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_running = Arc::new(AtomicBool::new(false));
     let is_running_task = is_running.clone();
 
+
+
+
     // Build tray menu
-    let start_menu_item = MenuItem::new(format!("Start [{}]", app_stem), true, None);
+    let mut start_menu_text = format!("Start [{}]",  &file_stem);
+    let app_installed = get_app_installed_path(config.app_path.clone().as_deref()).is_some();
+
+    let start_menu_item = MenuItem::new(
+        if app_installed { format!("▶ Start [{}]",  &file_stem) }
+        else { format!("⤵ Install [{}]", &file_stem) },
+        true,
+        None);
+    let config_app_item = MenuItem::new(format!("Config [{}]",  &file_stem), app_installed, None);
     let autostart_initial = get_autostart_state();
     let autostart_item = MenuItem::new(
         if autostart_initial { "Auto-start: [ON]-OFF" } else { "Auto-start: ON-[OFF]" },
-        true,
+        app_installed,
         None,
     );
     let config_rustbox_item = MenuItem::new("Config", true, None);
     let reload_config_item = MenuItem::new("Reload", true, None);
-    let config_app_item = MenuItem::new(format!("Config [{}]", app_stem), true, None);
     let quit_item = MenuItem::new("Exit", true, None);
 
     let start_menu_id = start_menu_item.id().clone();
@@ -232,9 +242,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let menu = Menu::new();
     menu.append(&start_menu_item)?;
-    menu.append(&config_app_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&config_app_item)?;
     menu.append(&autostart_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&config_rustbox_item)?;
     menu.append(&reload_config_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -427,7 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Update Start/Stop button label from manager
         while let Ok(running) = gui_rx.try_recv() {
-            let _ = start_menu_item.set_text(if running { "Stop" } else { "Start" });
+            let _ = start_menu_item.set_text(if running { format!("Stop [{}]", &file_stem) } else { format!("Start [{}]", &file_stem) });
         }
 
         // Process menu events
@@ -530,4 +541,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     manager_handle.abort();
 
     Ok(())
+}
+
+fn is_winget_available() -> bool {
+    std::process::Command::new("winget")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_choco_available() -> bool {
+    std::process::Command::new("choco")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_scoop_available() -> bool {
+    std::process::Command::new("scoop")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Get the full path to sing-box.exe.
+/// First checks app_path from rust-box.cfg, then falls back to PowerShell Get-Command.
+fn get_app_installed_path(app_path_from_config: Option<&str>) -> Option<String> {
+    // 1. If app_path is provided and file exists, use it
+    if let Some(path) = app_path_from_config {
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+
+    let install_app = Path::new(&app_path_from_config.unwrap())
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // 2. Fallback: PowerShell Get-Command
+    let ps_command = format!(
+        "Get-Command {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source",
+        &install_app
+    );
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &ps_command,
+        ])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let path = String::from_utf8(output.stdout).ok()?;
+        let path = path.trim();
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    None
 }
