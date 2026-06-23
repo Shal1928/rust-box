@@ -908,6 +908,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    if autostart_initial && app_installed && cfg_exists {
+        log_event("Auto-start enabled: starting child automatically");
+        eprintln!("Auto-start enabled: starting child automatically");
+        let _ = cmd_tx.send(ChildCommand::Start);
+    }
+
     // --- GUI event loop ---
     let mut event_loop = EventLoop::new()?;
     let cmd_tx_main = cmd_tx.clone();
