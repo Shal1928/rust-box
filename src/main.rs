@@ -8,14 +8,13 @@ use std::path::Path;
 use std::process;
 use std::process::Stdio;
 use std::ptr::null_mut;
-use std::string::ToString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::os::windows::process::CommandExt;
 
 use chrono::Local;
-use image::ImageReader;
+use image::{ImageReader, RgbaImage, Rgba};
 use processkit::ProcessGroup;
 use sysinfo::System;
 use tokio::io::AsyncReadExt;
@@ -71,6 +70,11 @@ enum InstallStatus {
 enum DialogCommand {
     Restart,
     Exit,
+}
+
+enum IconCommand {
+    Progress(u8),
+    Restore,
 }
 
 // ===== Auto-start via Task Scheduler =====
@@ -334,6 +338,42 @@ fn show_config_file_dialog() -> Option<String> {
         .and_then(|p| p.to_str().map(|s| s.to_string()))
 }
 
+// ===== Progress icon =====
+fn create_progress_icon(original_rgba: &[u8], width: u32, height: u32, progress: u8) -> tray_icon::Icon {
+    let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
+        .expect("Failed to create RgbaImage from original data");
+
+    // Convert to grayscale
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel_mut(x, y);
+            let [r, g, b, a] = pixel.0;
+            if a == 0 { continue; }
+            let gray = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
+            *pixel = Rgba([gray, gray, gray, a]);
+        }
+    }
+
+    // Fill from bottom with blue
+    let fill_height = (height as f32 * (progress as f32 / 100.0)) as u32;
+    if fill_height > 0 {
+        for y in (height - fill_height)..height {
+            for x in 0..width {
+                let pixel = img.get_pixel_mut(x, y);
+                let [r, g, b, a] = pixel.0;
+                let blend = 0.5;
+                let new_r = (r as f32 * (1.0 - blend) + 0.0) as u8;
+                let new_g = (g as f32 * (1.0 - blend) + 0.0) as u8;
+                let new_b = (b as f32 * (1.0 - blend) + 255.0 * blend) as u8;
+                *pixel = Rgba([new_r, new_g, new_b, a]);
+            }
+        }
+    }
+
+    let (w, h) = img.dimensions();
+    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create progress icon")
+}
+
 macro_rules! log_line {
     ($file:expr, $($arg:tt)*) => {{
         use std::io::Write;
@@ -544,13 +584,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
+    // Load tray icon
     let icon_bytes = include_bytes!("../rust-box.png");
     let img = ImageReader::new(Cursor::new(icon_bytes))
         .with_guessed_format()?
         .decode()?
         .into_rgba8();
     let (width, height) = img.dimensions();
-    let icon = tray_icon::Icon::from_rgba(img.into_raw(), width, height)?;
+    let orig_rgba = img.into_raw();
+    let icon = tray_icon::Icon::from_rgba(orig_rgba.clone(), width, height)?;
 
     let is_running = Arc::new(AtomicBool::new(false));
     let is_running_task = is_running.clone();
@@ -561,13 +603,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log_event(&format!("Startup state: app_installed={}, cfg_exists={}", app_installed, cfg_exists));
 
+    // Menu items with emojis
     let start_menu_item = MenuItem::new(
-        if app_installed {
+        if app_installed && cfg_exists {
+            format!("▶ Start [{}]", &file_stem)
+        } else if app_installed {
             format!("▶ Start [{}]", &file_stem)
         } else {
             format!("⤵ Install [{}]", &file_stem)
         },
-        true, // всегда enabled
+        true,
         None,
     );
     let config_app_item = MenuItem::new(
@@ -614,18 +659,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Rust Box")
-        .with_icon(icon)
+        .with_icon(icon.clone())
         .build()?;
 
     log_event("Tray icon created and menu built");
 
+    // Channels
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ChildCommand>();
     let (install_tx, mut install_rx) = mpsc::unbounded_channel::<InstallStatus>();
     let (gui_tx, mut gui_rx) = mpsc::unbounded_channel::<bool>();
     let (dialog_tx, mut dialog_rx) = mpsc::unbounded_channel::<DialogCommand>();
+    let (icon_cmd_tx, mut icon_cmd_rx) = mpsc::unbounded_channel::<IconCommand>();
+
     let tray_event_rx = TrayIconEvent::receiver();
     let menu_event_rx = MenuEvent::receiver();
 
+    // Clones for manager
     let cmd_tx_clone = cmd_tx.clone();
     let install_tx_clone = install_tx.clone();
     let cfg_path_clone_manager = cfg_path.clone();
@@ -637,6 +686,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let app_path_clone = resolved_app_path.clone();
 
+    // Animation control
+    let animation_running = Arc::new(AtomicBool::new(false));
+    let animation_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let icon_cmd_tx_clone = icon_cmd_tx.clone();
+
+    // --- Manager task ---
     let manager_handle = tokio::spawn(async move {
         let mut child_pid: Option<u32> = None;
         let mut process_group: Option<ProcessGroup> = None;
@@ -853,6 +908,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- GUI event loop ---
     let mut event_loop = EventLoop::new()?;
     let cmd_tx_main = cmd_tx.clone();
     let cmd_tx_main_clone = cmd_tx_main.clone();
@@ -862,18 +918,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.run_on_demand(move |_event, window_target| {
         window_target.set_control_flow(ControlFlow::Wait);
 
+        // Update Start/Stop button label from manager
         while let Ok(running) = gui_rx.try_recv() {
-            let _ = start_menu_item.set_text(if running {
+            let text = if running {
                 format!("⏹ Stop [{}]", &file_stem)
             } else {
                 format!("▶ Start [{}]", &file_stem)
-            });
+            };
+            let _ = start_menu_item.set_text(text);
         }
 
+        // Handle installation status updates
         while let Ok(status) = install_rx.try_recv() {
             match status {
+                InstallStatus::Installing { app_name } => {
+                    log_event(&format!("Installation started for {}", app_name));
+                    let _ = start_menu_item.set_text(format!("Installing [{}]...", app_name));
+                    let _ = start_menu_item.set_enabled(false);
+                    // Start animation
+                    if !animation_running.load(Ordering::SeqCst) {
+                        animation_running.store(true, Ordering::SeqCst);
+                        let running = animation_running.clone();
+                        let cmd_tx = icon_cmd_tx_clone.clone();
+                        let handle = std::thread::spawn(move || {
+                            let steps = [0, 25, 50, 75, 100];
+                            let mut step_idx = 0;
+                            while running.load(Ordering::SeqCst) {
+                                let _ = cmd_tx.send(IconCommand::Progress(steps[step_idx]));
+                                step_idx = (step_idx + 1) % steps.len();
+                                std::thread::sleep(Duration::from_millis(300));
+                            }
+                        });
+                        *animation_handle.lock().unwrap() = Some(handle);
+                    }
+                }
                 InstallStatus::Installed { path, app_name } => {
                     log_event(&format!("Installation completed: {} at {}", app_name, path));
+                    // Stop animation
+                    animation_running.store(false, Ordering::SeqCst);
+                    if let Some(h) = animation_handle.lock().unwrap().take() {
+                        let _ = h.join();
+                    }
+                    let _ = icon_cmd_tx.send(IconCommand::Restore);
                     let _ = start_menu_item.set_text(format!("▶ Start [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
                     let _ = config_app_item.set_enabled(true);
@@ -883,18 +969,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 InstallStatus::Failed { app_name, error } => {
                     log_event(&format!("Installation failed for {}: {}", app_name, error));
-                    let _ = start_menu_item.set_text(format!("Install [{}]", app_name));
+                    // Stop animation
+                    animation_running.store(false, Ordering::SeqCst);
+                    if let Some(h) = animation_handle.lock().unwrap().take() {
+                        let _ = h.join();
+                    }
+                    let _ = icon_cmd_tx.send(IconCommand::Restore);
+                    let _ = start_menu_item.set_text(format!("⤵ Install [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
                     eprintln!("❌ Installation failed: {}", error);
-                }
-                InstallStatus::Installing { app_name } => {
-                    log_event(&format!("Installation started for {}", app_name));
-                    let _ = start_menu_item.set_text(format!("Installing [{}]...", app_name));
-                    let _ = start_menu_item.set_enabled(false);
                 }
             }
         }
 
+        // Handle icon commands
+        while let Ok(cmd) = icon_cmd_rx.try_recv() {
+            match cmd {
+                IconCommand::Progress(p) => {
+                    let progress_icon = create_progress_icon(&orig_rgba, width, height, p);
+                    let _ = tray_icon.set_icon(Some(progress_icon));
+                }
+                IconCommand::Restore => {
+                    let _ = tray_icon.set_icon(Some(icon.clone()));
+                }
+            }
+        }
+
+        // Process menu events
         while let Ok(menu_event) = menu_event_rx.try_recv() {
             let id = menu_event.id;
 
@@ -913,11 +1014,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cmd_tx_main.send(ChildCommand::Stop)
                     };
                 } else {
-                    // installed but no config – show message or do nothing
+                    // installed but no config
                     let msg = "Application installed, but config file missing. Please select config.";
                     log_event(msg);
                     eprintln!("{}", msg);
-                    // Optionally show a dialog or open file selection
+                    #[cfg(windows)]
+                    unsafe {
+                        let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+                        let title = "Rust Box - Info";
+                        let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+                        MessageBoxW(
+                            null_mut(),
+                            msg_utf16.as_ptr(),
+                            title_utf16.as_ptr(),
+                            MB_OK | MB_ICONERROR,
+                        );
+                    }
                 }
             } else if id == autostart_id {
                 let current = get_autostart_state();
@@ -954,14 +1066,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if id == config_rustbox_id {
                 log_event("Opening rust-box config in Notepad");
                 let _ = std::process::Command::new("notepad")
-                    .arg(&"CONFIG_PATH")
+                    .arg(&"rust-box.cfg")
                     .spawn();
-            }
-            else if id == reload_config_id {
+            } else if id == reload_config_id {
                 log_event("Reload triggered: stopping child and restarting app");
                 let _ = cmd_tx_main.send(ChildCommand::Stop);
-                std::thread::sleep(std::time::Duration::from_secs(2));
-
+                std::thread::sleep(Duration::from_secs(2));
                 let exe = std::env::current_exe().expect("failed to get exe path");
                 let args: Vec<String> = std::env::args().collect();
                 let _ = std::process::Command::new(exe)
@@ -1018,6 +1128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Handle dialog responses (restart or exit)
         while let Ok(dialog_cmd) = dialog_rx.try_recv() {
             match dialog_cmd {
                 DialogCommand::Restart => {
@@ -1033,6 +1144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Left-click on tray icon shows the menu
         while let Ok(tray_event) = tray_event_rx.try_recv() {
             if let TrayIconEvent::Click { button, .. } = tray_event {
                 if button == tray_icon::MouseButton::Left {
@@ -1042,6 +1154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
+    // Final cleanup
     log_event("Main exit: sending stop command and aborting manager");
     let _ = cmd_tx.send(ChildCommand::Stop);
     tokio::time::sleep(Duration::from_millis(500)).await;
