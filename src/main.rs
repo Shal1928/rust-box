@@ -2,38 +2,70 @@
 
 mod config;
 
-use std::process;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::io::Cursor;
-use std::time::Duration;
-use std::path::Path;
-use std::ptr::null_mut;
 use std::env;
+use std::io::{Cursor, Write};
+use std::path::Path;
+use std::process;
+use std::process::Stdio;
+use std::ptr::null_mut;
+use std::string::ToString;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::os::windows::process::CommandExt;
 
-use tray_icon::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, MenuEvent},
-    TrayIconBuilder, TrayIconEvent,
-};
-use winit::event_loop::{EventLoop, ControlFlow};
-use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
+use chrono::Local;
 use image::ImageReader;
+use processkit::ProcessGroup;
+use sysinfo::System;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::io::AsyncReadExt;
-use sysinfo::System;
-use processkit::ProcessGroup;
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    TrayIconBuilder, TrayIconEvent,
+};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 
 #[cfg(windows)]
-use winapi::um::winuser::{MessageBoxW, MB_YESNO, MB_ICONERROR, MB_DEFBUTTON1, MB_OK};
+use winapi::um::winuser::{MessageBoxW, MB_DEFBUTTON1, MB_ICONERROR, MB_OK, MB_YESNO};
+
+use rfd::FileDialog;
 
 use crate::config::Config;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+// ===== Logging =====
+fn log_event(msg: &str) {
+    use std::io::Write;
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            let log_path = dir.join("app.log");
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(file, "[{}] {}", timestamp, msg);
+            }
+        }
+    }
+}
+
 enum ChildCommand {
+    Install,
     Start,
     Stop,
+    UpdateConfigPath(String),
+}
+
+enum InstallStatus {
+    Installing { app_name: String },
+    Installed { path: String, app_name: String },
+    Failed { app_name: String, error: String },
 }
 
 enum DialogCommand {
@@ -41,26 +73,24 @@ enum DialogCommand {
     Exit,
 }
 
-// ===== Auto-start via Task Scheduler (interactive user session) =====
+// ===== Auto-start via Task Scheduler =====
 const TASK_NAME: &str = "RustBox";
 
-/// Get current Windows username for task scheduler.
 fn get_username() -> String {
-    // Try environment variable first
     if let Ok(user) = std::env::var("USERNAME") {
         return user;
     }
-    // Fallback: use `whoami` command
     let output = std::process::Command::new("whoami")
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok());
     output.unwrap_or_else(|| "".to_string())
 }
 
-/// Check if the scheduled task exists.
 fn get_autostart_state() -> bool {
     let output = std::process::Command::new("schtasks")
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["/query", "/tn", TASK_NAME])
         .output();
     match output {
@@ -69,7 +99,6 @@ fn get_autostart_state() -> bool {
     }
 }
 
-/// Create or delete a scheduled task for auto‑start with interactive session.
 fn set_autostart_state(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = env::current_exe()?.display().to_string();
     let quoted_path = format!("\"{}\"", exe_path);
@@ -81,13 +110,19 @@ fn set_autostart_state(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let output = std::process::Command::new("schtasks")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "/create",
-                "/tn", TASK_NAME,
-                "/tr", &quoted_path,
-                "/sc", "onlogon",
-                "/ru", &username,
-                "/rl", "HIGHEST",
+                "/tn",
+                TASK_NAME,
+                "/tr",
+                &quoted_path,
+                "/sc",
+                "onlogon",
+                "/ru",
+                &username,
+                "/rl",
+                "HIGHEST",
                 "/it",
                 "/f",
             ])
@@ -97,21 +132,27 @@ fn set_autostart_state(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
             let err = String::from_utf8_lossy(&output.stderr);
             return Err(format!("schtasks create failed: {}", err).into());
         }
-        eprintln!("✅ Autostart enabled (task as user {} with interactive session)", username);
+        log_event(&format!("Autostart enabled (user {})", username));
+        eprintln!(
+            "✅ Autostart enabled (task as user {} with interactive session)",
+            username
+        );
     } else {
         let _ = std::process::Command::new("schtasks")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["/delete", "/tn", TASK_NAME, "/f"])
             .output();
+        log_event("Autostart disabled");
         eprintln!("✅ Autostart disabled");
     }
     Ok(())
 }
 
 // ===== Restart dialog =====
-/// Show a Windows message box asking whether to restart the crashed child process.
 #[cfg(windows)]
 fn show_restart_dialog() -> DialogCommand {
-    let message = "sing-box has crashed or terminated unexpectedly.\nDo you want to restart it?";
+    let message =
+        "The application has crashed or terminated unexpectedly.\nDo you want to restart it?";
     let title = "Rust Box - Error";
     let message_utf16: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
     let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
@@ -123,34 +164,362 @@ fn show_restart_dialog() -> DialogCommand {
             MB_YESNO | MB_ICONERROR | MB_DEFBUTTON1,
         )
     };
-    if result == 6 { DialogCommand::Restart } else { DialogCommand::Exit }
+    if result == 6 {
+        DialogCommand::Restart
+    } else {
+        DialogCommand::Exit
+    }
 }
 
 #[cfg(not(windows))]
-fn show_restart_dialog() -> DialogCommand { DialogCommand::Exit }
+fn show_restart_dialog() -> DialogCommand {
+    DialogCommand::Exit
+}
+
+// ===== Package managers =====
+fn is_winget_available() -> bool {
+    std::process::Command::new("winget")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_choco_available() -> bool {
+    std::process::Command::new("choco")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_scoop_available() -> bool {
+    std::process::Command::new("scoop")
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// ===== Application installation and path resolution =====
+fn find_app_by_name(app_name: &str) -> Option<String> {
+    let ps_command = format!(
+        "Get-Command {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source",
+        app_name
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_command])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let path = String::from_utf8(output.stdout).ok()?;
+        let path = path.trim();
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn resolve_app_path(app_path_from_config: &str) -> Option<String> {
+    if (app_path_from_config.contains('\\') || app_path_from_config.contains('/'))
+        && app_path_from_config.to_lowercase().ends_with(".exe")
+        && std::path::Path::new(app_path_from_config).exists()
+    {
+        return Some(app_path_from_config.to_string());
+    }
+
+    let app_name = app_path_from_config;
+    if app_name.is_empty() {
+        return None;
+    }
+
+    if let Some(path) = find_app_by_name(app_name) {
+        return Some(path);
+    }
+
+    find_app_binary(app_name)
+}
+
+fn find_app_binary(app_name: &str) -> Option<String> {
+    if let Some(path) = find_app_by_name(app_name) {
+        return Some(path);
+    }
+
+    let choco_shim = format!(r"C:\ProgramData\chocolatey\bin\{}.exe", app_name);
+    if std::path::Path::new(&choco_shim).exists() {
+        return Some(choco_shim);
+    }
+
+    let choco_base = format!(r"C:\ProgramData\chocolatey\lib\{}", app_name);
+    if let Ok(entries) = std::fs::read_dir(&choco_base) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(exe) = find_exe_recursive(&path, app_name) {
+                    return Some(exe);
+                }
+            }
+        }
+    }
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let winget_base = format!(r"{}\Microsoft\WinGet\Packages", local_app_data);
+        if let Ok(entries) = std::fs::read_dir(&winget_base) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(exe) = find_exe_recursive(&path, app_name) {
+                        return Some(exe);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(user) = std::env::var("USERNAME") {
+        let scoop_path = format!(
+            r"C:\Users\{}\scoop\apps\{}\current\{}.exe",
+            user, app_name, app_name
+        );
+        if std::path::Path::new(&scoop_path).exists() {
+            return Some(scoop_path);
+        }
+    }
+
+    let common_paths = [
+        format!(r"C:\Program Files\{}\{}.exe", app_name, app_name),
+        format!(r"C:\Program Files (x86)\{}\{}.exe", app_name, app_name),
+    ];
+    for path in common_paths.iter() {
+        if std::path::Path::new(path).exists() {
+            return Some(path.clone());
+        }
+    }
+
+    None
+}
+
+fn find_exe_recursive(dir: &std::path::Path, app_name: &str) -> Option<String> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(exe) = find_exe_recursive(&path, app_name) {
+                    return Some(exe);
+                }
+            } else if let Some(ext) = path.extension() {
+                if ext == "exe" {
+                    if let Some(stem) = path.file_stem() {
+                        if stem.to_string_lossy().to_lowercase() == app_name.to_lowercase() {
+                            return Some(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn show_config_file_dialog() -> Option<String> {
+    FileDialog::new()
+        .add_filter("JSON files", &["json"])
+        .add_filter("All files", &["*"])
+        .pick_file()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+}
+
+macro_rules! log_line {
+    ($file:expr, $($arg:tt)*) => {{
+        use std::io::Write;
+        writeln!($file, $($arg)*)?;
+        $file.flush()?;
+    }};
+}
+
+async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path.parent().ok_or("No exe dir")?;
+    let log_path = exe_dir.join("install.log");
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(&log_path)?;
+
+    log_line!(log_file, "=== Install started for app: {} ===", app_name);
+
+    let has_winget = is_winget_available();
+    let has_choco = is_choco_available();
+    let has_scoop = is_scoop_available();
+
+    log_line!(
+        log_file,
+        "Has winget: {}, choco: {}, scoop: {}",
+        has_winget,
+        has_choco,
+        has_scoop
+    );
+
+    let methods: Vec<(&str, Box<dyn Fn() -> tokio::process::Command + Send + Sync>)> = vec![
+        (
+            "winget",
+            Box::new(|| {
+                let mut cmd = Command::new("winget");
+                cmd.args([
+                    "install",
+                    "--id",
+                    app_name,
+                    "-e",
+                    "--silent",
+                    "--source",
+                    "winget",
+                    "--accept-source-agreements",
+                    "--accept-package-agreements",
+                    "--disable-interactivity",
+                ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(CREATE_NO_WINDOW);
+                cmd
+            }),
+        ),
+        (
+            "choco",
+            Box::new(|| {
+                let mut cmd = Command::new("choco");
+                cmd.args(["install", app_name, "-y", "--accept-license"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(CREATE_NO_WINDOW);
+                cmd
+            }),
+        ),
+        (
+            "scoop",
+            Box::new(|| {
+                let mut cmd = Command::new("scoop");
+                cmd.args(["install", app_name])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(CREATE_NO_WINDOW);
+                cmd
+            }),
+        ),
+    ];
+
+    for (name, cmd_builder) in methods {
+        let available = match name {
+            "winget" => is_winget_available(),
+            "choco" => is_choco_available(),
+            "scoop" => is_scoop_available(),
+            _ => false,
+        };
+        if !available {
+            log_line!(log_file, "Method {} not available, skipping.", name);
+            continue;
+        }
+
+        log_line!(log_file, "Attempting install via {}", name);
+        let mut child = match cmd_builder().spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                log_line!(log_file, "Failed to spawn {}: {}", name, e);
+                continue;
+            }
+        };
+
+        log_line!(log_file, "{} spawned, waiting for completion...", name);
+
+        let output =
+            match tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await {
+                Ok(Ok(out)) => out,
+                Ok(Err(e)) => {
+                    log_line!(log_file, "{} wait error: {}", name, e);
+                    continue;
+                }
+                Err(_) => {
+                    log_line!(
+                        log_file,
+                        "{} timed out after 60 seconds, skipping to next method.",
+                        name
+                    );
+                    continue;
+                }
+            };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log_line!(log_file, "=== {} stdout ===\n{}", name, stdout);
+        log_line!(log_file, "=== {} stderr ===\n{}", name, stderr);
+        log_line!(
+            log_file,
+            "Exit code: {}",
+            output.status.code().unwrap_or(-1)
+        );
+
+        if output.status.success() {
+            log_line!(log_file, "{} succeeded, searching for binary...", name);
+            if let Some(path) = find_app_binary(app_name) {
+                log_line!(log_file, "Found binary at: {}", path);
+                return Ok(path);
+            } else {
+                log_line!(log_file, "Binary not found after {} install.", name);
+            }
+        } else {
+            log_line!(log_file, "{} failed with non-zero exit code.", name);
+        }
+    }
+
+    log_line!(log_file, "All installation methods failed.");
+    Err("No installation method succeeded".into())
+}
 
 // ===== Main entry point =====
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pid = std::process::id();
+    log_event(&format!("=== Rust Box started (PID: {}) ===", pid));
+
     // --- Set current directory to the executable's directory (release only) ---
     if cfg!(not(debug_assertions)) {
-        if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
             if let Err(e) = std::env::set_current_dir(&exe_dir) {
-                eprintln!("Warning: Could not set CWD: {}", e);
+                let msg = format!("Could not set CWD: {}", e);
+                log_event(&msg);
+                eprintln!("Warning: {}", msg);
             } else {
+                log_event(&format!("CWD set to: {:?}", exe_dir));
                 eprintln!("CWD set to: {:?}", exe_dir);
             }
         }
     }
 
-    // Load configuration
-    let config = Config::build(std::env::args()).unwrap_or_else(|err| {
-        eprintln!("Config error: {err}");
-        process::exit(1);
-    });
+    let config = match Config::load_or_create_default() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Config error: {:?}", e);
+            log_event(&msg);
+            eprintln!("{}", msg);
+            process::exit(1);
+        }
+    };
 
     let app_path = config.app_path.as_ref().unwrap().clone();
     let cfg_path = config.cfg_path.as_ref().unwrap().clone();
+
+    log_event(&format!("Config loaded: app_path='{}', cfg_path='{}'", app_path, cfg_path));
 
     let file_stem = Path::new(&app_path)
         .file_stem()
@@ -164,40 +533,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string_lossy()
         .to_string();
 
-    // Path to the rust-box config file (default if not provided)
-    let config_path = env::args().nth(1).unwrap_or_else(|| "rust-box.cfg".to_string());
+    let cfg_path_for_gui = Arc::new(Mutex::new(cfg_path.clone()));
 
-    // Clone for GUI use (opening the child config)
-    let cfg_path_for_gui = cfg_path.clone();
-
-
-    // Diagnostic logging (now uses the correct CWD)
-    // let log_path = std::env::current_dir()
-    //     .unwrap_or_else(|_| Path::new(".").to_path_buf())
-    //     .join("startup.log");
-    // if let Ok(mut file) = std::fs::OpenOptions::new()
-    //     .create(true)
-    //     .append(true)
-    //     .open(&log_path)
-    // {
-    //     use std::io::Write;
-    //     let _ = writeln!(file, "Started at {:?}", std::time::SystemTime::now());
-    //     let _ = writeln!(file, "Args: {:?}", std::env::args().collect::<Vec<_>>());
-    //     let _ = writeln!(file, "CWD: {:?}", std::env::current_dir());
-    //     let _ = writeln!(file, "Exe: {:?}", std::env::current_exe());
-    //     let _ = writeln!(file, "---");
-    // }
-
-
-    // Cleanup orphaned processes on startup
     eprintln!("Startup: killing any existing {} processes", app_name);
+    log_event(&format!("Startup cleanup: killing any existing {} processes", app_name));
     let _ = Command::new("taskkill")
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["/F", "/IM", &app_name])
         .output()
         .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Load tray icon from embedded PNG
     let icon_bytes = include_bytes!("../rust-box.png");
     let img = ImageReader::new(Cursor::new(icon_bytes))
         .with_guessed_format()?
@@ -206,26 +552,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = img.dimensions();
     let icon = tray_icon::Icon::from_rgba(img.into_raw(), width, height)?;
 
-    // Shared state for Start/Stop toggle
     let is_running = Arc::new(AtomicBool::new(false));
     let is_running_task = is_running.clone();
 
+    let resolved_path = resolve_app_path(&app_path);
+    let app_installed = resolved_path.is_some();
+    let cfg_exists = Path::new(&cfg_path).exists();
 
-
-
-    // Build tray menu
-    let mut start_menu_text = format!("Start [{}]",  &file_stem);
-    let app_installed = get_app_installed_path(config.app_path.clone().as_deref()).is_some();
+    log_event(&format!("Startup state: app_installed={}, cfg_exists={}", app_installed, cfg_exists));
 
     let start_menu_item = MenuItem::new(
-        if app_installed { format!("▶ Start [{}]",  &file_stem) }
-        else { format!("⤵ Install [{}]", &file_stem) },
+        if app_installed {
+            format!("▶ Start [{}]", &file_stem)
+        } else {
+            format!("⤵ Install [{}]", &file_stem)
+        },
+        true, // всегда enabled
+        None,
+    );
+    let config_app_item = MenuItem::new(
+        if cfg_exists {
+            format!("Open json [{}]", &file_stem)
+        } else {
+            "Select json file".to_string()
+        },
         true,
-        None);
-    let config_app_item = MenuItem::new(format!("Config [{}]",  &file_stem), app_installed, None);
+        None,
+    );
     let autostart_initial = get_autostart_state();
     let autostart_item = MenuItem::new(
-        if autostart_initial { "Auto-start: [ON]-OFF" } else { "Auto-start: ON-[OFF]" },
+        if autostart_initial {
+            "Auto-start: [ON]-OFF"
+        } else {
+            "Auto-start: ON-[OFF]"
+        },
         app_installed,
         None,
     );
@@ -245,9 +605,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&config_app_item)?;
     menu.append(&autostart_item)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&config_rustbox_item)?;
-    menu.append(&reload_config_item)?;
+    // menu.append(&PredefinedMenuItem::separator())?;
+    // menu.append(&config_rustbox_item)?;
+    // menu.append(&reload_config_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
@@ -257,52 +617,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_icon(icon)
         .build()?;
 
-    // Channels for inter-thread communication
+    log_event("Tray icon created and menu built");
+
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ChildCommand>();
+    let (install_tx, mut install_rx) = mpsc::unbounded_channel::<InstallStatus>();
     let (gui_tx, mut gui_rx) = mpsc::unbounded_channel::<bool>();
     let (dialog_tx, mut dialog_rx) = mpsc::unbounded_channel::<DialogCommand>();
     let tray_event_rx = TrayIconEvent::receiver();
     let menu_event_rx = MenuEvent::receiver();
 
-    // Clones for the manager task
     let cmd_tx_clone = cmd_tx.clone();
-    let app_path_clone = app_path.clone();
-    let cfg_path_clone = cfg_path.clone();
-    let app_name_clone = app_name.clone();
+    let install_tx_clone = install_tx.clone();
+    let cfg_path_clone_manager = cfg_path.clone();
+    let resolved_app_path = resolve_app_path(&app_path).unwrap_or_else(|| app_path.clone());
+    let app_name_clone = Path::new(&resolved_app_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let app_path_clone = resolved_app_path.clone();
 
-    // --- Manager task: controls the child process ---
     let manager_handle = tokio::spawn(async move {
         let mut child_pid: Option<u32> = None;
         let mut process_group: Option<ProcessGroup> = None;
         let mut child_handle: Option<tokio::process::Child> = None;
         let mut dialog_shown = false;
+        let mut current_app_path = app_path_clone;
+        let mut current_app_name = app_name_clone;
+        let mut current_cfg_path = cfg_path_clone_manager;
 
         loop {
             tokio::select! {
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
+                        ChildCommand::UpdateConfigPath(new_path) => {
+                            current_cfg_path = new_path.clone();
+                            log_event(&format!("Config path updated in manager to: {}", new_path));
+                            eprintln!("Config path updated to: {}", current_cfg_path);
+                        }
+                        ChildCommand::Install => {
+                            let app_name = Path::new(&current_app_path)
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+
+                            let _ = install_tx_clone.send(InstallStatus::Installing {
+                                app_name: app_name.clone(),
+                            });
+
+                            let install_result = install_app(&app_name).await;
+
+                            match install_result {
+                                Ok(installed_path) => {
+                                    current_app_path = installed_path.clone();
+                                    current_app_name = Path::new(&installed_path)
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string();
+
+                                    log_event(&format!("Installation succeeded: {}", installed_path));
+                                    let _ = install_tx_clone.send(InstallStatus::Installed {
+                                        path: installed_path,
+                                        app_name,
+                                    });
+                                }
+                                Err(e) => {
+                                    log_event(&format!("Installation failed: {}", e));
+                                    let _ = install_tx_clone.send(InstallStatus::Failed {
+                                        app_name,
+                                        error: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
                         ChildCommand::Start => {
+                            if !std::path::Path::new(&current_app_path).exists() {
+                                let msg = format!("ERROR: Application not found at: {}", current_app_path);
+                                log_event(&msg);
+                                eprintln!("{}", msg);
+                                continue;
+                            }
+
                             if child_pid.is_none() {
-                                // Kill any leftover processes
-                                eprintln!("Start: killing all {} processes", app_name_clone);
+                                log_event(&format!("Starting child: {} with config {}", current_app_path, current_cfg_path));
+                                eprintln!("Start: killing all {} processes", current_app_name);
                                 let _ = Command::new("taskkill")
-                                    .args(["/F", "/IM", &app_name_clone])
+                                    .creation_flags(CREATE_NO_WINDOW)
+                                    .args(["/F", "/IM", &current_app_name])
                                     .output()
                                     .await;
                                 tokio::time::sleep(Duration::from_secs(1)).await;
 
-                                // PowerShell script to launch the child with elevation
                                 let ps_script = format!(
-                                    r#"$p = Start-Process -FilePath "{}" -ArgumentList "run -c {}" -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ $p.Id }}"#,
-                                    app_path_clone, cfg_path_clone
+                                    r#"$p = Start-Process -FilePath "{}" -ArgumentList "run","-c","{}" -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ $p.Id }}"#,
+                                    current_app_path, current_cfg_path
                                 );
+                                eprintln!("Launching: {} with config: {}", current_app_path, current_cfg_path);
                                 eprintln!("PowerShell command: {}", ps_script);
 
-                                // Create a process group to ensure termination
                                 let group = match ProcessGroup::new() {
                                     Ok(g) => g,
                                     Err(e) => {
-                                        eprintln!("Failed to create ProcessGroup: {}", e);
+                                        let msg = format!("Failed to create ProcessGroup: {}", e);
+                                        log_event(&msg);
+                                        eprintln!("{}", msg);
                                         continue;
                                     }
                                 };
@@ -316,7 +736,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut child = match group.spawn(&mut cmd) {
                                     Ok(c) => c,
                                     Err(e) => {
-                                        eprintln!("Failed to spawn child in group: {}", e);
+                                        let msg = format!("Failed to spawn child in group: {}", e);
+                                        log_event(&msg);
+                                        eprintln!("{}", msg);
                                         continue;
                                     }
                                 };
@@ -341,11 +763,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("PowerShell stdout: '{}'", pid_str);
 
                                 if let Ok(pid) = pid_str.parse::<u32>() {
-                                    // Verify the process is still running
                                     let sys = System::new_all();
                                     let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
                                     if !still_running {
-                                        eprintln!("Child process {} died immediately", pid);
+                                        let msg = format!("Child process {} died immediately", pid);
+                                        log_event(&msg);
+                                        eprintln!("{}", msg);
                                         continue;
                                     }
 
@@ -354,15 +777,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     child_handle = Some(child);
                                     is_running_task.store(true, Ordering::SeqCst);
                                     dialog_shown = false;
+                                    log_event(&format!("Child process started successfully (PID: {})", pid));
                                     eprintln!("Started child PID: {}", pid);
                                     let _ = gui_tx.send(true);
                                 } else {
-                                    eprintln!("Failed to parse PID from stdout: '{}'", pid_str);
+                                    let msg = format!("Failed to parse PID from stdout: '{}'", pid_str);
+                                    log_event(&msg);
+                                    eprintln!("{}", msg);
                                 }
                             }
                         }
                         ChildCommand::Stop => {
-                            // Drop the process group – this kills all processes in the group
+                            log_event("Stopping child process...");
                             if let Some(group) = process_group.take() {
                                 drop(group);
                                 eprintln!("ProcessGroup dropped");
@@ -371,15 +797,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = child.kill().await;
                                 let _ = child.wait().await;
                             }
-                            // Additional cleanup by name
-                            eprintln!("Stop: killing all {} processes", app_name_clone);
+                            eprintln!("Stop: killing all {} processes", current_app_name);
                             let _ = Command::new("taskkill")
-                                .args(["/F", "/IM", &app_name_clone])
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .args(["/F", "/IM", &current_app_name])
                                 .output()
                                 .await;
                             tokio::time::sleep(Duration::from_secs(1)).await;
 
-                            // Wait for process to fully terminate
                             if let Some(pid) = child_pid {
                                 for _ in 0..10 {
                                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -388,31 +813,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if !still_running { break; }
                                 }
                             }
-                            // Extra delay to release system resources
                             tokio::time::sleep(Duration::from_secs(2)).await;
 
                             child_pid = None;
                             is_running_task.store(false, Ordering::SeqCst);
                             dialog_shown = false;
+                            log_event("Child process stopped.");
                             eprintln!("Stop completed, all processes cleaned up");
                             let _ = gui_tx.send(false);
                         }
                     }
                 }
-                // Periodic monitoring: check if child process unexpectedly died
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     if let Some(pid) = child_pid {
                         let sys = System::new_all();
                         let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
                         if !still_running {
-                            eprintln!("Child {} terminated unexpectedly", pid);
+                            let msg = format!("Child process (PID {}) terminated unexpectedly", pid);
+                            log_event(&msg);
+                            eprintln!("{}", msg);
                             child_pid = None;
                             process_group.take();
                             child_handle.take();
                             is_running_task.store(false, Ordering::SeqCst);
                             let _ = gui_tx.send(false);
 
-                            // Show restart dialog only once per crash
                             if !dialog_shown {
                                 dialog_shown = true;
                                 let dialog_tx_clone = dialog_tx.clone();
@@ -428,30 +853,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- GUI event loop (winit) ---
     let mut event_loop = EventLoop::new()?;
     let cmd_tx_main = cmd_tx.clone();
     let cmd_tx_main_clone = cmd_tx_main.clone();
+    let app_installed_flag = Arc::new(AtomicBool::new(app_installed));
+    let app_installed_flag_gui = app_installed_flag.clone();
 
     event_loop.run_on_demand(move |_event, window_target| {
         window_target.set_control_flow(ControlFlow::Wait);
 
-        // Update Start/Stop button label from manager
         while let Ok(running) = gui_rx.try_recv() {
-            let _ = start_menu_item.set_text(if running { format!("Stop [{}]", &file_stem) } else { format!("Start [{}]", &file_stem) });
+            let _ = start_menu_item.set_text(if running {
+                format!("⏹ Stop [{}]", &file_stem)
+            } else {
+                format!("▶ Start [{}]", &file_stem)
+            });
         }
 
-        // Process menu events
+        while let Ok(status) = install_rx.try_recv() {
+            match status {
+                InstallStatus::Installed { path, app_name } => {
+                    log_event(&format!("Installation completed: {} at {}", app_name, path));
+                    let _ = start_menu_item.set_text(format!("▶ Start [{}]", app_name));
+                    let _ = start_menu_item.set_enabled(true);
+                    let _ = config_app_item.set_enabled(true);
+                    let _ = autostart_item.set_enabled(true);
+                    app_installed_flag.store(true, Ordering::SeqCst);
+                    eprintln!("✅ App installed at: {}", path);
+                }
+                InstallStatus::Failed { app_name, error } => {
+                    log_event(&format!("Installation failed for {}: {}", app_name, error));
+                    let _ = start_menu_item.set_text(format!("Install [{}]", app_name));
+                    let _ = start_menu_item.set_enabled(true);
+                    eprintln!("❌ Installation failed: {}", error);
+                }
+                InstallStatus::Installing { app_name } => {
+                    log_event(&format!("Installation started for {}", app_name));
+                    let _ = start_menu_item.set_text(format!("Installing [{}]...", app_name));
+                    let _ = start_menu_item.set_enabled(false);
+                }
+            }
+        }
+
         while let Ok(menu_event) = menu_event_rx.try_recv() {
             let id = menu_event.id;
 
             if id == start_menu_id {
-                let running = is_running.load(Ordering::SeqCst);
-                let _ = if !running {
-                    cmd_tx_main.send(ChildCommand::Start)
+                let installed = app_installed_flag.load(Ordering::SeqCst);
+                let cfg_exists = Path::new(&*cfg_path_for_gui.lock().unwrap()).exists();
+                if !installed {
+                    // Install
+                    let _ = cmd_tx_main.send(ChildCommand::Install);
+                } else if installed && cfg_exists {
+                    // Start/Stop
+                    let running = is_running.load(Ordering::SeqCst);
+                    let _ = if !running {
+                        cmd_tx_main.send(ChildCommand::Start)
+                    } else {
+                        cmd_tx_main.send(ChildCommand::Stop)
+                    };
                 } else {
-                    cmd_tx_main.send(ChildCommand::Stop)
-                };
+                    // installed but no config – show message or do nothing
+                    let msg = "Application installed, but config file missing. Please select config.";
+                    log_event(msg);
+                    eprintln!("{}", msg);
+                    // Optionally show a dialog or open file selection
+                }
             } else if id == autostart_id {
                 let current = get_autostart_state();
                 let new_state = !current;
@@ -466,58 +933,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("Autostart set to {}", new_state);
                     }
                     Err(e) => {
-                        eprintln!("Failed to change autostart: {}", e);
+                        let msg = format!("Failed to change autostart: {}", e);
+                        log_event(&msg);
+                        eprintln!("{}", msg);
                         #[cfg(windows)]
                         unsafe {
-                            let msg = format!("Failed to set autostart: {}", e);
                             let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
                             let title = "Rust Box - Error";
-                            let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-                            MessageBoxW(null_mut(), msg_utf16.as_ptr(), title_utf16.as_ptr(), MB_OK | MB_ICONERROR);
+                            let title_utf16: Vec<u16> =
+                                title.encode_utf16().chain(Some(0)).collect();
+                            MessageBoxW(
+                                null_mut(),
+                                msg_utf16.as_ptr(),
+                                title_utf16.as_ptr(),
+                                MB_OK | MB_ICONERROR,
+                            );
                         }
                     }
                 }
             } else if id == config_rustbox_id {
-                // Open rust-box config in Notepad
+                log_event("Opening rust-box config in Notepad");
                 let _ = std::process::Command::new("notepad")
-                    .arg(&config_path)
+                    .arg(&"CONFIG_PATH")
                     .spawn();
-            } else if id == reload_config_id {
-                // Reload rust-box
-                // Stop child process if running
+            }
+            else if id == reload_config_id {
+                log_event("Reload triggered: stopping child and restarting app");
                 let _ = cmd_tx_main.send(ChildCommand::Stop);
-                // Give it time to terminate (2 seconds should be enough)
                 std::thread::sleep(std::time::Duration::from_secs(2));
 
-                // Restart the application
                 let exe = std::env::current_exe().expect("failed to get exe path");
                 let args: Vec<String> = std::env::args().collect();
-                // Start new process, skipping the first argument (which is the exe path)
                 let _ = std::process::Command::new(exe)
+                    .creation_flags(CREATE_NO_WINDOW)
                     .args(&args[1..])
                     .spawn();
-                // Exit current process
-                window_target.exit(); // or std::process::exit(0)
-            }else if id == config_app_id {
-                // Open child app config in Notepad
-                let _ = std::process::Command::new("notepad")
-                    .arg(&cfg_path_for_gui)
-                    .spawn();
+                window_target.exit();
+            } else if id == config_app_id {
+                let current_cfg = cfg_path_for_gui.lock().unwrap().clone();
+                let cfg_exists = Path::new(&current_cfg).exists();
+                if cfg_exists {
+                    log_event(&format!("Opening json config in Notepad: {}", current_cfg));
+                    let _ = std::process::Command::new("notepad")
+                        .arg(&current_cfg)
+                        .spawn();
+                } else {
+                    log_event("Config file not found, showing file dialog");
+                    if let Some(selected) = show_config_file_dialog() {
+                        log_event(&format!("User selected config file: {}", selected));
+                        if let Err(e) = Config::update_cfg_path(&selected) {
+                            let msg = format!("Failed to update cfg_path: {}", e);
+                            log_event(&msg);
+                            eprintln!("{}", msg);
+                            #[cfg(windows)]
+                            unsafe {
+                                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+                                let title = "Rust Box - Error";
+                                let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+                                MessageBoxW(
+                                    null_mut(),
+                                    msg_utf16.as_ptr(),
+                                    title_utf16.as_ptr(),
+                                    MB_OK | MB_ICONERROR,
+                                );
+                            }
+                        } else {
+                            log_event(&format!("Config path updated to: {}", selected));
+                            *cfg_path_for_gui.lock().unwrap() = selected.clone();
+                            let _ = config_app_item.set_text(format!("Open json [{}]", &file_stem));
+                            if app_installed_flag.load(Ordering::SeqCst) {
+                                let _ = start_menu_item.set_enabled(true);
+                            }
+                            let _ = cmd_tx_main.send(ChildCommand::UpdateConfigPath(selected));
+                        }
+                    } else {
+                        log_event("User cancelled file selection");
+                    }
+                }
             } else if id == quit_id {
-                // Stop child and exit
+                log_event("Quit requested, stopping child and exiting");
                 let _ = cmd_tx_main.send(ChildCommand::Stop);
                 std::thread::sleep(Duration::from_millis(500));
                 window_target.exit();
             }
         }
 
-        // Handle dialog responses (restart or exit)
         while let Ok(dialog_cmd) = dialog_rx.try_recv() {
             match dialog_cmd {
                 DialogCommand::Restart => {
+                    log_event("User chose to restart the child process after crash");
                     let _ = cmd_tx_main_clone.send(ChildCommand::Start);
                 }
                 DialogCommand::Exit => {
+                    log_event("User chose to exit after child crash");
                     let _ = cmd_tx_main_clone.send(ChildCommand::Stop);
                     std::thread::sleep(Duration::from_millis(500));
                     window_target.exit();
@@ -525,7 +1033,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Left-click on tray icon shows the menu
         while let Ok(tray_event) = tray_event_rx.try_recv() {
             if let TrayIconEvent::Click { button, .. } = tray_event {
                 if button == tray_icon::MouseButton::Left {
@@ -535,73 +1042,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // Final cleanup on normal exit
+    log_event("Main exit: sending stop command and aborting manager");
     let _ = cmd_tx.send(ChildCommand::Stop);
     tokio::time::sleep(Duration::from_millis(500)).await;
     manager_handle.abort();
 
+    log_event("=== Rust Box terminated ===");
     Ok(())
-}
-
-fn is_winget_available() -> bool {
-    std::process::Command::new("winget")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn is_choco_available() -> bool {
-    std::process::Command::new("choco")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn is_scoop_available() -> bool {
-    std::process::Command::new("scoop")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Get the full path to sing-box.exe.
-/// First checks app_path from rust-box.cfg, then falls back to PowerShell Get-Command.
-fn get_app_installed_path(app_path_from_config: Option<&str>) -> Option<String> {
-    // 1. If app_path is provided and file exists, use it
-    if let Some(path) = app_path_from_config {
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            return Some(path.to_string());
-        }
-    }
-
-    let install_app = Path::new(&app_path_from_config.unwrap())
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    // 2. Fallback: PowerShell Get-Command
-    let ps_command = format!(
-        "Get-Command {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source",
-        &install_app
-    );
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &ps_command,
-        ])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8(output.stdout).ok()?;
-        let path = path.trim();
-        if !path.is_empty() && std::path::Path::new(path).exists() {
-            return Some(path.to_string());
-        }
-    }
-    None
 }

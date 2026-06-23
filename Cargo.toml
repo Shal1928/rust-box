@@ -10,6 +10,9 @@ tokio = { version = "1.52", features = ["full", "process"] }
 winit = "0.29"
 sysinfo = "0.35"
 processkit = "0.5"
+rfd = "0.14"
+chrono = "0.4.45"
+base64 = "0.22.1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser"] }

@@ -1,2 +1,2 @@
 # rust-box
-ui for sing-box
+System tray controller for elevated processes.

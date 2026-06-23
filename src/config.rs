@@ -1,5 +1,36 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Error as IoError};
+use std::io::{BufRead, BufReader, Write, Error as IoError};
+use std::path::Path;
+use std::env;
+use base64::decode;
+
+const DEFAULT_CONFIG_NAME: &str = "rust-box.cfg";
+
+const DEFAULT_APP_PATH: &str = "c2luZy1ib3g=";
+const DEFAULT_CFG_PATH: &str = "Y29uZmlnLmpzb24=";
+
+fn decode_b64(s: &str) -> Result<String, String> {
+    let bytes = decode(s).map_err(|e| format!("Base64 decode error: {}", e))?;
+    String::from_utf8(bytes).map_err(|e| format!("UTF-8 decode error: {}", e))
+}
+
+struct DefaultConfig {
+    app_path: String,
+    cfg_path: String,
+}
+
+impl DefaultConfig {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            app_path: decode_b64(DEFAULT_APP_PATH)?,
+            cfg_path: decode_b64(DEFAULT_CFG_PATH)?,
+        })
+    }
+
+    fn to_string(&self) -> String {
+        format!("app_path={}\ncfg_path={}\n", self.app_path, self.cfg_path)
+    }
+}
 
 pub struct Config {
     pub app_path: Option<String>,
@@ -18,23 +49,33 @@ impl Config {
         Self { app_path, cfg_path }
     }
 
-    pub fn build(mut args: impl Iterator<Item = String>) -> Result<Config, &'static str> {
-        args.next();
-        let rb_cfg_path = args.next().unwrap_or_else(|| "rust-box.cfg".to_string());
-        Ok(Self::load_config_or_panic(&rb_cfg_path))
+    pub fn load_from_path(path: &str) -> Result<Self, ConfigError> {
+        Self::load_config(path)
     }
 
-    fn load_config_or_panic(file_path: &str) -> Self {
-        let file = File::open(file_path).unwrap_or_else(|error| {
-            panic!("File open trouble: {error:?}");
-        });
+    pub fn load_or_create_default() -> Result<Self, ConfigError> {
+        let config_path = Self::ensure_config_file().map_err(|e| ConfigError::IoError(IoError::new(std::io::ErrorKind::Other, e)))?;
+        Self::load_from_path(&config_path.to_string_lossy())
+    }
 
-        let cfg = Self::from_reader(&mut BufReader::new(file)).unwrap_or_else(|error| {
-            panic!("Parsing trouble: {error:?}");
-        });
+    pub fn ensure_config_file() -> Result<std::path::PathBuf, String> {
+        let exe_path = env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+        let exe_dir = exe_path.parent().ok_or("No exe dir")?;
+        let config_path = exe_dir.join(DEFAULT_CONFIG_NAME);
+        if !config_path.exists() {
+            let default = DefaultConfig::new()?;
+            let mut file = File::create(&config_path).map_err(|e| format!("create file: {}", e))?;
+            file.write_all(default.to_string().as_bytes()).map_err(|e| format!("write file: {}", e))?;
+            eprintln!("✅ Created default config file: {}", config_path.display());
+        }
+        Ok(config_path)
+    }
 
-        cfg.check_required().expect("Required fields expects!");
-        cfg
+    fn load_config(file_path: &str) -> Result<Self, ConfigError> {
+        let file = File::open(file_path).map_err(ConfigError::IoError)?;
+        let cfg = Self::from_reader(&mut BufReader::new(file))?;
+        cfg.check_required()?;
+        Ok(cfg)
     }
 
     fn from_reader<R: BufRead>(reader: R) -> Result<Self, ConfigError> {
@@ -88,6 +129,48 @@ impl Config {
         if self.cfg_path.is_none() {
             return Err(ConfigError::MissingField("cfg_path is required".to_string()));
         }
+        Ok(())
+    }
+
+    pub fn update_cfg_path(new_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let exe_path = env::current_exe()?;
+        let exe_dir = exe_path.parent().ok_or("No exe dir")?;
+        let config_path = exe_dir.join(DEFAULT_CONFIG_NAME);
+        let content = std::fs::read_to_string(&config_path)?;
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let mut found = false;
+        for line in &mut lines {
+            if line.starts_with("cfg_path=") {
+                *line = format!("cfg_path={}", new_path);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            lines.push(format!("cfg_path={}", new_path));
+        }
+        std::fs::write(&config_path, lines.join("\n"))?;
+        Ok(())
+    }
+
+    pub fn update_app_path(new_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let exe_path = env::current_exe()?;
+        let exe_dir = exe_path.parent().ok_or("No exe dir")?;
+        let config_path = exe_dir.join(DEFAULT_CONFIG_NAME);
+        let content = std::fs::read_to_string(&config_path)?;
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let mut found = false;
+        for line in &mut lines {
+            if line.starts_with("app_path=") {
+                *line = format!("app_path={}", new_path);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            lines.push(format!("app_path={}", new_path));
+        }
+        std::fs::write(&config_path, lines.join("\n"))?;
         Ok(())
     }
 }
