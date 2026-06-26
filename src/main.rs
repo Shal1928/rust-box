@@ -36,6 +36,18 @@ use crate::config::Config;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+// ===== Timing constants (tunable) =====
+const TIMEOUT_START_TASKKILL: Duration = Duration::from_secs(2);
+const TIMEOUT_START_PID_KILL: Duration = Duration::from_millis(200);
+const TIMEOUT_START_SPAWN_WAIT: Duration = Duration::from_millis(200);
+const TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS: usize = 10;
+const TIMEOUT_STOP_POST_TASKKILL: Duration = Duration::from_secs(2);
+const TIMEOUT_STOP_FINAL_RESOURCE_RELEASE: Duration = Duration::from_secs(3);
+const TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS: usize = 15;
+const TIMEOUT_STARTUP_CLEANUP: Duration = Duration::from_secs(1);
+const TIMEOUT_RELOAD_SLEEP: Duration = Duration::from_secs(2);
+const RETRY_DELAY_BASE_SECS: u64 = 2;
+
 // ===== Logging =====
 fn log_event(msg: &str) {
     use std::io::Write;
@@ -51,6 +63,20 @@ fn log_event(msg: &str) {
                 let _ = writeln!(file, "[{}] {}", timestamp, msg);
             }
         }
+    }
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok();
+    if let Some(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout.contains(&pid.to_string())
+    } else {
+        false
     }
 }
 
@@ -584,7 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args(["/F", "/IM", &app_name])
         .output()
         .await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(TIMEOUT_STARTUP_CLEANUP).await;
 
     // Load tray icon
     let icon_bytes = include_bytes!("../rust-box.png");
@@ -764,15 +790,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
 
+                            if !std::path::Path::new(&current_cfg_path).exists() {
+                                let msg = format!("ERROR: Config file not found: {}", current_cfg_path);
+                                log_event(&msg);
+                                eprintln!("{}", msg);
+                                // Optionally show dialog or continue
+                                continue;
+                            }
+
                             if child_pid.is_none() {
                                 log_event(&format!("Starting child: {} with config {}", current_app_path, current_cfg_path));
                                 eprintln!("Start: killing all {} processes", current_app_name);
+
+                                // Kill any existing process by name
                                 let _ = Command::new("taskkill")
                                     .creation_flags(CREATE_NO_WINDOW)
                                     .args(["/F", "/IM", &current_app_name])
                                     .output()
                                     .await;
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                tokio::time::sleep(TIMEOUT_START_TASKKILL).await;
+
+                                // Also kill by PID if we had one
+                                if let Some(pid) = child_pid {
+                                    let _ = Command::new("taskkill")
+                                        .creation_flags(CREATE_NO_WINDOW)
+                                        .args(["/F", "/PID", &pid.to_string()])
+                                        .output()
+                                        .await;
+                                    tokio::time::sleep(TIMEOUT_START_PID_KILL).await;
+                                    child_pid = None;
+                                }
+
+                                // --- Force remove TUN adapter to release resources completely ---
+                                log_event("Removing TUN adapter...");
+                                let remove_script = r#"
+$adapter = Get-NetAdapter | Where-Object { $_.Name -like "*tun*" -or $_.Name -like "*sing*" -or $_.Name -like "*wintun*" }
+if ($adapter) {
+    $adapter | Disable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $adapter | Remove-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Write-Host "TUN adapter removed"
+} else {
+    Write-Host "No TUN adapter found"
+}
+"#;
+                                let remove_output = Command::new("powershell")
+                                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", remove_script])
+                                    .creation_flags(CREATE_NO_WINDOW)
+                                    .output()
+                                    .await;
+                                if let Ok(out) = remove_output {
+                                    let stdout = String::from_utf8_lossy(&out.stdout);
+                                    let stderr = String::from_utf8_lossy(&out.stderr);
+                                    log_event(&format!("Remove output: {} {}", stdout, stderr));
+                                }
 
                                 let ps_script = format!(
                                     r#"$p = Start-Process -FilePath "{}" -ArgumentList "run","-c","{}" -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ $p.Id }}"#,
@@ -781,6 +853,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("Launching: {} with config: {}", current_app_path, current_cfg_path);
                                 eprintln!("PowerShell command: {}", ps_script);
 
+                                // Create a process group to ensure termination
                                 let group = match ProcessGroup::new() {
                                     Ok(g) => g,
                                     Err(e) => {
@@ -791,23 +864,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 };
 
+                                // Use tokio::process::Command with CREATE_NO_WINDOW flag
                                 let mut cmd = Command::new("powershell");
                                 cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
-                                    .creation_flags(CREATE_NO_WINDOW)
                                     .stdout(std::process::Stdio::piped())
-                                    .stderr(std::process::Stdio::piped());
+                                    .stderr(std::process::Stdio::piped())
+                                    .creation_flags(CREATE_NO_WINDOW);
 
-                                let mut child = match group.spawn(&mut cmd) {
+                                let mut child = match cmd.spawn() {
                                     Ok(c) => c,
                                     Err(e) => {
-                                        let msg = format!("Failed to spawn child in group: {}", e);
+                                        let msg = format!("Failed to spawn child: {}", e);
                                         log_event(&msg);
                                         eprintln!("{}", msg);
                                         continue;
                                     }
                                 };
 
-                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                // Adopt the child into the process group (so it gets killed on main exit)
+                                if let Err(e) = group.adopt(&mut child) {
+                                    let msg = format!("Failed to adopt child into group: {}", e);
+                                    log_event(&msg);
+                                    eprintln!("{}", msg);
+                                    // Continue anyway – process is still running
+                                }
+
+                                tokio::time::sleep(TIMEOUT_START_SPAWN_WAIT).await;
 
                                 let mut stdout = String::new();
                                 let mut stderr = String::new();
@@ -827,26 +909,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("PowerShell stdout: '{}'", pid_str);
 
                                 if let Ok(pid) = pid_str.parse::<u32>() {
-                                    let sys = System::new_all();
-                                    let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
-                                    if !still_running {
-                                        // Процесс умер сразу
+                                    // Use is_process_alive to verify
+                                    if !is_process_alive(pid) {
+                                        // Process died immediately
                                         let msg = format!("Child process {} died immediately", pid);
                                         log_event(&msg);
                                         eprintln!("{}", msg);
 
                                         if auto_start_pending {
+                                            // Progressive retry: 2, 4, 6, 8, 10 seconds
+                                            let delay_secs = RETRY_DELAY_BASE_SECS + (auto_start_attempts * 2);
                                             auto_start_attempts += 1;
-                                            if auto_start_attempts < 3 {
-                                                log_event(&format!("Auto-start attempt {} failed, retrying in 5 seconds...", auto_start_attempts));
+                                            if auto_start_attempts < 5 {
+                                                log_event(&format!("Auto-start attempt {} failed, retrying in {} seconds...", auto_start_attempts, delay_secs));
                                                 let cmd_tx_retry = cmd_tx_clone.clone();
                                                 tokio::spawn(async move {
-                                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                                                     let _ = cmd_tx_retry.send(ChildCommand::Start);
                                                 });
                                                 continue;
                                             } else {
-                                                // все три попытки провалились
+                                                // all attempts exhausted
                                                 auto_start_pending = false;
                                                 auto_start_attempts = 0;
                                                 let dialog_tx_clone = dialog_tx.clone();
@@ -854,18 +937,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 continue;
                                             }
                                         } else {
-                                            // обычный запуск, просто выходим
+                                            // normal start, just exit
                                             continue;
                                         }
                                     }
 
-                                    // Процесс успешно запущен
+                                    // Successfully started
                                     child_pid = Some(pid);
                                     process_group = Some(group);
                                     child_handle = Some(child);
                                     is_running_task.store(true, Ordering::SeqCst);
                                     dialog_shown = false;
-                                    // Сбрасываем флаги автостарта при успехе
                                     auto_start_pending = false;
                                     auto_start_attempts = 0;
                                     log_event(&format!("Child process started successfully (PID: {})", pid));
@@ -875,14 +957,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let msg = format!("Failed to parse PID from stdout: '{}'", pid_str);
                                     log_event(&msg);
                                     eprintln!("{}", msg);
-                                    // Если не удалось получить PID, считаем это неудачей для автостарта
                                     if auto_start_pending {
+                                        let delay_secs = RETRY_DELAY_BASE_SECS + (auto_start_attempts * 2);
                                         auto_start_attempts += 1;
-                                        if auto_start_attempts < 3 {
-                                            log_event(&format!("Auto-start attempt {} failed (no PID), retrying...", auto_start_attempts));
+                                        if auto_start_attempts < 5 {
+                                            log_event(&format!("Auto-start attempt {} failed (no PID), retrying in {} seconds...", auto_start_attempts, delay_secs));
                                             let cmd_tx_retry = cmd_tx_clone.clone();
                                             tokio::spawn(async move {
-                                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                                                 let _ = cmd_tx_retry.send(ChildCommand::Start);
                                             });
                                             continue;
@@ -899,6 +981,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         ChildCommand::Stop => {
                             log_event("Stopping child process...");
+
+                            // Try graceful shutdown first
+                            if let Some(pid) = child_pid {
+                                let _ = Command::new("taskkill")
+                                    .creation_flags(CREATE_NO_WINDOW)
+                                    .args(["/PID", &pid.to_string()])
+                                    .output()
+                                    .await;
+                                // Wait a few seconds for graceful exit
+                                for _ in 0..TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS {
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                    if !is_process_alive(pid) {
+                                        break;
+                                    }
+                                }
+                                // If still alive, force kill
+                                if is_process_alive(pid) {
+                                    let _ = Command::new("taskkill")
+                                        .creation_flags(CREATE_NO_WINDOW)
+                                        .args(["/F", "/PID", &pid.to_string()])
+                                        .output()
+                                        .await;
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                            }
+
+                            // Also kill via process group
                             if let Some(group) = process_group.take() {
                                 drop(group);
                                 eprintln!("ProcessGroup dropped");
@@ -907,23 +1016,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = child.kill().await;
                                 let _ = child.wait().await;
                             }
+
+                            // Kill by name as fallback
                             eprintln!("Stop: killing all {} processes", current_app_name);
                             let _ = Command::new("taskkill")
                                 .creation_flags(CREATE_NO_WINDOW)
                                 .args(["/F", "/IM", &current_app_name])
                                 .output()
                                 .await;
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(TIMEOUT_STOP_POST_TASKKILL).await;
 
+                            // Wait for process to fully terminate
                             if let Some(pid) = child_pid {
-                                for _ in 0..10 {
+                                for _ in 0..TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS {
                                     tokio::time::sleep(Duration::from_millis(100)).await;
                                     let sys = System::new_all();
                                     let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
                                     if !still_running { break; }
                                 }
                             }
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            // Extra delay to release system resources (especially network/TUN)
+                            tokio::time::sleep(TIMEOUT_STOP_FINAL_RESOURCE_RELEASE).await;
 
                             child_pid = None;
                             is_running_task.store(false, Ordering::SeqCst);
@@ -947,6 +1060,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             child_handle.take();
                             is_running_task.store(false, Ordering::SeqCst);
                             let _ = gui_tx.send(false);
+
+                            // Give system a moment to release resources before showing dialog
+                            tokio::time::sleep(Duration::from_secs(1)).await;
 
                             if !dialog_shown {
                                 dialog_shown = true;
@@ -1132,7 +1248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if id == reload_config_id {
                 log_event("Reload triggered: stopping child and restarting app");
                 let _ = cmd_tx_main.send(ChildCommand::Stop);
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(TIMEOUT_RELOAD_SLEEP);
                 let exe = std::env::current_exe().expect("failed to get exe path");
                 let args: Vec<String> = std::env::args().collect();
                 let _ = std::process::Command::new(exe)
@@ -1192,12 +1308,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handle dialog responses (restart or exit)
         while let Ok(dialog_cmd) = dialog_rx.try_recv() {
             match dialog_cmd {
-                DialogCommand::Restart => { /*...*/ }
-                DialogCommand::Exit => { /*...*/ }
+                DialogCommand::Restart => {
+                    log_event("User chose to restart the child process after crash");
+                    let _ = cmd_tx_main_clone.send(ChildCommand::Start);
+                }
+                DialogCommand::Exit => {
+                    log_event("User chose to exit after child crash");
+                    let _ = cmd_tx_main_clone.send(ChildCommand::Stop);
+                    std::thread::sleep(Duration::from_millis(500));
+                    window_target.exit();
+                }
                 DialogCommand::RetryAutoStart => {
                     #[cfg(windows)]
                     unsafe {
-                        let msg = "Auto-start failed after 3 attempts. Retry?";
+                        let msg = "Auto-start failed after 5 attempts. Retry?";
                         let title = "Rust Box - Auto-start";
                         let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
                         let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
@@ -1208,6 +1332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             MB_YESNO | MB_ICONQUESTION,
                         );
                         if result == 6 {
+                            // Reset attempts and send AutoStart again
                             let _ = cmd_tx_main_clone.send(ChildCommand::AutoStart);
                         }
                     }
