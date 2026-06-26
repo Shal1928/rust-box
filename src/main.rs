@@ -37,16 +37,16 @@ use crate::config::Config;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // ===== Timing constants (tunable) =====
-const TIMEOUT_START_TASKKILL: Duration = Duration::from_secs(2);
+const TIMEOUT_START_TASKKILL: Duration = Duration::from_secs(1);
 const TIMEOUT_START_PID_KILL: Duration = Duration::from_millis(200);
 const TIMEOUT_START_SPAWN_WAIT: Duration = Duration::from_millis(200);
 const TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS: usize = 10;
-const TIMEOUT_STOP_POST_TASKKILL: Duration = Duration::from_secs(2);
+const TIMEOUT_STOP_POST_TASKKILL: Duration = Duration::from_secs(1);
 const TIMEOUT_STOP_FINAL_RESOURCE_RELEASE: Duration = Duration::from_secs(3);
 const TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS: usize = 15;
 const TIMEOUT_STARTUP_CLEANUP: Duration = Duration::from_secs(1);
-const TIMEOUT_RELOAD_SLEEP: Duration = Duration::from_secs(2);
-const RETRY_DELAY_BASE_SECS: u64 = 2;
+const TIMEOUT_RELOAD_SLEEP: Duration = Duration::from_secs(1);
+const RETRY_DELAY_BASE_SECS: u64 = 1;
 
 // ===== Logging =====
 fn log_event(msg: &str) {
@@ -610,7 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args(["/F", "/IM", &app_name])
         .output()
         .await;
-    tokio::time::sleep(TIMEOUT_STARTUP_CLEANUP).await;
+    // tokio::time::sleep(TIMEOUT_STARTUP_CLEANUP).await;
 
     // Load tray icon
     let icon_bytes = include_bytes!("../rust-box.png");
@@ -808,7 +808,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .args(["/F", "/IM", &current_app_name])
                                     .output()
                                     .await;
-                                tokio::time::sleep(TIMEOUT_START_TASKKILL).await;
+                                // tokio::time::sleep(TIMEOUT_START_TASKKILL).await;
 
                                 // Also kill by PID if we had one
                                 if let Some(pid) = child_pid {
@@ -817,7 +817,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .args(["/F", "/PID", &pid.to_string()])
                                         .output()
                                         .await;
-                                    tokio::time::sleep(TIMEOUT_START_PID_KILL).await;
+                                    // tokio::time::sleep(TIMEOUT_START_PID_KILL).await;
                                     child_pid = None;
                                 }
 
@@ -889,7 +889,7 @@ if ($adapter) {
                                     // Continue anyway – process is still running
                                 }
 
-                                tokio::time::sleep(TIMEOUT_START_SPAWN_WAIT).await;
+                                // tokio::time::sleep(TIMEOUT_START_SPAWN_WAIT).await;
 
                                 let mut stdout = String::new();
                                 let mut stderr = String::new();
@@ -1003,7 +1003,7 @@ if ($adapter) {
                                         .args(["/F", "/PID", &pid.to_string()])
                                         .output()
                                         .await;
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    // tokio::time::sleep(Duration::from_secs(1)).await;
                                 }
                             }
 
@@ -1024,7 +1024,7 @@ if ($adapter) {
                                 .args(["/F", "/IM", &current_app_name])
                                 .output()
                                 .await;
-                            tokio::time::sleep(TIMEOUT_STOP_POST_TASKKILL).await;
+                            // tokio::time::sleep(TIMEOUT_STOP_POST_TASKKILL).await;
 
                             // Wait for process to fully terminate
                             if let Some(pid) = child_pid {
@@ -1036,7 +1036,7 @@ if ($adapter) {
                                 }
                             }
                             // Extra delay to release system resources (especially network/TUN)
-                            tokio::time::sleep(TIMEOUT_STOP_FINAL_RESOURCE_RELEASE).await;
+                            // tokio::time::sleep(TIMEOUT_STOP_FINAL_RESOURCE_RELEASE).await;
 
                             child_pid = None;
                             is_running_task.store(false, Ordering::SeqCst);
@@ -1248,7 +1248,7 @@ if ($adapter) {
             } else if id == reload_config_id {
                 log_event("Reload triggered: stopping child and restarting app");
                 let _ = cmd_tx_main.send(ChildCommand::Stop);
-                std::thread::sleep(TIMEOUT_RELOAD_SLEEP);
+                // std::thread::sleep(TIMEOUT_RELOAD_SLEEP);
                 let exe = std::env::current_exe().expect("failed to get exe path");
                 let args: Vec<String> = std::env::args().collect();
                 let _ = std::process::Command::new(exe)
