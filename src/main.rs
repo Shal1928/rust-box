@@ -31,7 +31,7 @@ use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winapi::um::winuser::{MessageBoxW, MB_DEFBUTTON1, MB_ICONERROR, MB_OK, MB_YESNO};
 
 use rfd::FileDialog;
-
+use winapi::um::winuser::MB_ICONQUESTION;
 use crate::config::Config;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -59,6 +59,7 @@ enum ChildCommand {
     Start,
     Stop,
     UpdateConfigPath(String),
+    AutoStart,
 }
 
 enum InstallStatus {
@@ -70,6 +71,7 @@ enum InstallStatus {
 enum DialogCommand {
     Restart,
     Exit,
+    RetryAutoStart,
 }
 
 enum IconCommand {
@@ -700,6 +702,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut current_app_path = app_path_clone;
         let mut current_app_name = app_name_clone;
         let mut current_cfg_path = cfg_path_clone_manager;
+        let mut auto_start_attempts = 0;
+        let mut auto_start_pending = false;
 
         loop {
             tokio::select! {
@@ -746,6 +750,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     });
                                 }
                             }
+                        }
+                        ChildCommand::AutoStart => {
+                            auto_start_pending = true;
+                            auto_start_attempts = 0;
+                            let _ = cmd_tx_clone.send(ChildCommand::Start);
                         }
                         ChildCommand::Start => {
                             if !std::path::Path::new(&current_app_path).exists() {
@@ -821,17 +830,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let sys = System::new_all();
                                     let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
                                     if !still_running {
+                                        // Процесс умер сразу
                                         let msg = format!("Child process {} died immediately", pid);
                                         log_event(&msg);
                                         eprintln!("{}", msg);
-                                        continue;
+
+                                        if auto_start_pending {
+                                            auto_start_attempts += 1;
+                                            if auto_start_attempts < 3 {
+                                                log_event(&format!("Auto-start attempt {} failed, retrying in 5 seconds...", auto_start_attempts));
+                                                let cmd_tx_retry = cmd_tx_clone.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                                    let _ = cmd_tx_retry.send(ChildCommand::Start);
+                                                });
+                                                continue;
+                                            } else {
+                                                // все три попытки провалились
+                                                auto_start_pending = false;
+                                                auto_start_attempts = 0;
+                                                let dialog_tx_clone = dialog_tx.clone();
+                                                let _ = dialog_tx_clone.send(DialogCommand::RetryAutoStart);
+                                                continue;
+                                            }
+                                        } else {
+                                            // обычный запуск, просто выходим
+                                            continue;
+                                        }
                                     }
 
+                                    // Процесс успешно запущен
                                     child_pid = Some(pid);
                                     process_group = Some(group);
                                     child_handle = Some(child);
                                     is_running_task.store(true, Ordering::SeqCst);
                                     dialog_shown = false;
+                                    // Сбрасываем флаги автостарта при успехе
+                                    auto_start_pending = false;
+                                    auto_start_attempts = 0;
                                     log_event(&format!("Child process started successfully (PID: {})", pid));
                                     eprintln!("Started child PID: {}", pid);
                                     let _ = gui_tx.send(true);
@@ -839,6 +875,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let msg = format!("Failed to parse PID from stdout: '{}'", pid_str);
                                     log_event(&msg);
                                     eprintln!("{}", msg);
+                                    // Если не удалось получить PID, считаем это неудачей для автостарта
+                                    if auto_start_pending {
+                                        auto_start_attempts += 1;
+                                        if auto_start_attempts < 3 {
+                                            log_event(&format!("Auto-start attempt {} failed (no PID), retrying...", auto_start_attempts));
+                                            let cmd_tx_retry = cmd_tx_clone.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                                let _ = cmd_tx_retry.send(ChildCommand::Start);
+                                            });
+                                            continue;
+                                        } else {
+                                            auto_start_pending = false;
+                                            auto_start_attempts = 0;
+                                            let dialog_tx_clone = dialog_tx.clone();
+                                            let _ = dialog_tx_clone.send(DialogCommand::RetryAutoStart);
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -911,7 +966,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if autostart_initial && app_installed && cfg_exists {
         log_event("Auto-start enabled: starting child automatically");
         eprintln!("Auto-start enabled: starting child automatically");
-        let _ = cmd_tx.send(ChildCommand::Start);
+        let _ = cmd_tx.send(ChildCommand::AutoStart);
     }
 
     // --- GUI event loop ---
@@ -1137,15 +1192,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handle dialog responses (restart or exit)
         while let Ok(dialog_cmd) = dialog_rx.try_recv() {
             match dialog_cmd {
-                DialogCommand::Restart => {
-                    log_event("User chose to restart the child process after crash");
-                    let _ = cmd_tx_main_clone.send(ChildCommand::Start);
-                }
-                DialogCommand::Exit => {
-                    log_event("User chose to exit after child crash");
-                    let _ = cmd_tx_main_clone.send(ChildCommand::Stop);
-                    std::thread::sleep(Duration::from_millis(500));
-                    window_target.exit();
+                DialogCommand::Restart => { /*...*/ }
+                DialogCommand::Exit => { /*...*/ }
+                DialogCommand::RetryAutoStart => {
+                    #[cfg(windows)]
+                    unsafe {
+                        let msg = "Auto-start failed after 3 attempts. Retry?";
+                        let title = "Rust Box - Auto-start";
+                        let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+                        let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+                        let result = MessageBoxW(
+                            null_mut(),
+                            msg_utf16.as_ptr(),
+                            title_utf16.as_ptr(),
+                            MB_YESNO | MB_ICONQUESTION,
+                        );
+                        if result == 6 {
+                            let _ = cmd_tx_main_clone.send(ChildCommand::AutoStart);
+                        }
+                    }
                 }
             }
         }
