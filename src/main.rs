@@ -36,17 +36,17 @@ use crate::config::Config;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-// ===== Timing constants (tunable) =====
-const TIMEOUT_START_TASKKILL: Duration = Duration::from_secs(1);
-const TIMEOUT_START_PID_KILL: Duration = Duration::from_millis(200);
-const TIMEOUT_START_SPAWN_WAIT: Duration = Duration::from_millis(200);
-const TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS: usize = 10;
-const TIMEOUT_STOP_POST_TASKKILL: Duration = Duration::from_secs(1);
-const TIMEOUT_STOP_FINAL_RESOURCE_RELEASE: Duration = Duration::from_secs(3);
-const TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS: usize = 15;
-const TIMEOUT_STARTUP_CLEANUP: Duration = Duration::from_secs(1);
-const TIMEOUT_RELOAD_SLEEP: Duration = Duration::from_secs(1);
-const RETRY_DELAY_BASE_SECS: u64 = 1;
+// ===== Timing constants (tunable) – currently commented out =====
+// const TIMEOUT_START_TASKKILL: Duration = Duration::from_secs(2);
+// const TIMEOUT_START_PID_KILL: Duration = Duration::from_millis(200);
+// const TIMEOUT_START_SPAWN_WAIT: Duration = Duration::from_millis(200);
+// const TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS: usize = 10;
+// const TIMEOUT_STOP_POST_TASKKILL: Duration = Duration::from_secs(2);
+// const TIMEOUT_STOP_FINAL_RESOURCE_RELEASE: Duration = Duration::from_secs(3);
+// const TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS: usize = 15;
+// const TIMEOUT_STARTUP_CLEANUP: Duration = Duration::from_secs(1);
+// const TIMEOUT_RELOAD_SLEEP: Duration = Duration::from_secs(2);
+// const RETRY_DELAY_BASE_SECS: u64 = 2;
 
 // ===== Logging =====
 fn log_event(msg: &str) {
@@ -610,7 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args(["/F", "/IM", &app_name])
         .output()
         .await;
-    // tokio::time::sleep(TIMEOUT_STARTUP_CLEANUP).await;
+    // tokio::time::sleep(TIMEOUT_STARTUP_CLEANUP).await; // commented out
 
     // Load tray icon
     let icon_bytes = include_bytes!("../rust-box.png");
@@ -787,6 +787,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = format!("ERROR: Application not found at: {}", current_app_path);
                                 log_event(&msg);
                                 eprintln!("{}", msg);
+                                // Notify GUI that start failed (if not auto-start)
+                                if !auto_start_pending {
+                                    let _ = gui_tx.send(false);
+                                }
                                 continue;
                             }
 
@@ -794,7 +798,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = format!("ERROR: Config file not found: {}", current_cfg_path);
                                 log_event(&msg);
                                 eprintln!("{}", msg);
-                                // Optionally show dialog or continue
+                                if !auto_start_pending {
+                                    let _ = gui_tx.send(false);
+                                }
                                 continue;
                             }
 
@@ -808,7 +814,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .args(["/F", "/IM", &current_app_name])
                                     .output()
                                     .await;
-                                // tokio::time::sleep(TIMEOUT_START_TASKKILL).await;
+                                // tokio::time::sleep(TIMEOUT_START_TASKKILL).await; // commented out
 
                                 // Also kill by PID if we had one
                                 if let Some(pid) = child_pid {
@@ -817,7 +823,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .args(["/F", "/PID", &pid.to_string()])
                                         .output()
                                         .await;
-                                    // tokio::time::sleep(TIMEOUT_START_PID_KILL).await;
+                                    // tokio::time::sleep(TIMEOUT_START_PID_KILL).await; // commented out
                                     child_pid = None;
                                 }
 
@@ -860,6 +866,9 @@ if ($adapter) {
                                         let msg = format!("Failed to create ProcessGroup: {}", e);
                                         log_event(&msg);
                                         eprintln!("{}", msg);
+                                        if !auto_start_pending {
+                                            let _ = gui_tx.send(false);
+                                        }
                                         continue;
                                     }
                                 };
@@ -877,6 +886,9 @@ if ($adapter) {
                                         let msg = format!("Failed to spawn child: {}", e);
                                         log_event(&msg);
                                         eprintln!("{}", msg);
+                                        if !auto_start_pending {
+                                            let _ = gui_tx.send(false);
+                                        }
                                         continue;
                                     }
                                 };
@@ -889,7 +901,7 @@ if ($adapter) {
                                     // Continue anyway – process is still running
                                 }
 
-                                // tokio::time::sleep(TIMEOUT_START_SPAWN_WAIT).await;
+                                // tokio::time::sleep(TIMEOUT_START_SPAWN_WAIT).await; // commented out
 
                                 let mut stdout = String::new();
                                 let mut stderr = String::new();
@@ -918,7 +930,7 @@ if ($adapter) {
 
                                         if auto_start_pending {
                                             // Progressive retry: 2, 4, 6, 8, 10 seconds
-                                            let delay_secs = RETRY_DELAY_BASE_SECS + (auto_start_attempts * 2);
+                                            let delay_secs = 2 + (auto_start_attempts * 2);
                                             auto_start_attempts += 1;
                                             if auto_start_attempts < 5 {
                                                 log_event(&format!("Auto-start attempt {} failed, retrying in {} seconds...", auto_start_attempts, delay_secs));
@@ -937,7 +949,8 @@ if ($adapter) {
                                                 continue;
                                             }
                                         } else {
-                                            // normal start, just exit
+                                            // normal start, just notify GUI of failure
+                                            let _ = gui_tx.send(false);
                                             continue;
                                         }
                                     }
@@ -958,7 +971,7 @@ if ($adapter) {
                                     log_event(&msg);
                                     eprintln!("{}", msg);
                                     if auto_start_pending {
-                                        let delay_secs = RETRY_DELAY_BASE_SECS + (auto_start_attempts * 2);
+                                        let delay_secs = 2 + (auto_start_attempts * 2);
                                         auto_start_attempts += 1;
                                         if auto_start_attempts < 5 {
                                             log_event(&format!("Auto-start attempt {} failed (no PID), retrying in {} seconds...", auto_start_attempts, delay_secs));
@@ -975,6 +988,9 @@ if ($adapter) {
                                             let _ = dialog_tx_clone.send(DialogCommand::RetryAutoStart);
                                             continue;
                                         }
+                                    } else {
+                                        let _ = gui_tx.send(false);
+                                        continue;
                                     }
                                 }
                             }
@@ -990,7 +1006,7 @@ if ($adapter) {
                                     .output()
                                     .await;
                                 // Wait a few seconds for graceful exit
-                                for _ in 0..TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS {
+                                for _ in 0..10 { // TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS
                                     tokio::time::sleep(Duration::from_millis(250)).await;
                                     if !is_process_alive(pid) {
                                         break;
@@ -1003,7 +1019,7 @@ if ($adapter) {
                                         .args(["/F", "/PID", &pid.to_string()])
                                         .output()
                                         .await;
-                                    // tokio::time::sleep(Duration::from_secs(1)).await;
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
                                 }
                             }
 
@@ -1024,11 +1040,11 @@ if ($adapter) {
                                 .args(["/F", "/IM", &current_app_name])
                                 .output()
                                 .await;
-                            // tokio::time::sleep(TIMEOUT_STOP_POST_TASKKILL).await;
+                            // tokio::time::sleep(TIMEOUT_STOP_POST_TASKKILL).await; // commented out
 
                             // Wait for process to fully terminate
                             if let Some(pid) = child_pid {
-                                for _ in 0..TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS {
+                                for _ in 0..15 { // TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS
                                     tokio::time::sleep(Duration::from_millis(100)).await;
                                     let sys = System::new_all();
                                     let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
@@ -1036,7 +1052,7 @@ if ($adapter) {
                                 }
                             }
                             // Extra delay to release system resources (especially network/TUN)
-                            // tokio::time::sleep(TIMEOUT_STOP_FINAL_RESOURCE_RELEASE).await;
+                            // tokio::time::sleep(TIMEOUT_STOP_FINAL_RESOURCE_RELEASE).await; // commented out
 
                             child_pid = None;
                             is_running_task.store(false, Ordering::SeqCst);
@@ -1183,13 +1199,14 @@ if ($adapter) {
                     // Install
                     let _ = cmd_tx_main.send(ChildCommand::Install);
                 } else if installed && cfg_exists {
-                    // Start/Stop
                     let running = is_running.load(Ordering::SeqCst);
-                    let _ = if !running {
-                        cmd_tx_main.send(ChildCommand::Start)
+                    if !running {
+                        // Immediately change label to Stop
+                        let _ = start_menu_item.set_text(format!("⏹ Stop [{}]", &file_stem));
+                        let _ = cmd_tx_main.send(ChildCommand::Start);
                     } else {
-                        cmd_tx_main.send(ChildCommand::Stop)
-                    };
+                        let _ = cmd_tx_main.send(ChildCommand::Stop);
+                    }
                 } else {
                     // installed but no config
                     let msg = "Application installed, but config file missing. Please select config.";
@@ -1248,7 +1265,8 @@ if ($adapter) {
             } else if id == reload_config_id {
                 log_event("Reload triggered: stopping child and restarting app");
                 let _ = cmd_tx_main.send(ChildCommand::Stop);
-                // std::thread::sleep(TIMEOUT_RELOAD_SLEEP);
+                // std::thread::sleep(TIMEOUT_RELOAD_SLEEP); // commented out
+                std::thread::sleep(Duration::from_secs(2));
                 let exe = std::env::current_exe().expect("failed to get exe path");
                 let args: Vec<String> = std::env::args().collect();
                 let _ = std::process::Command::new(exe)
