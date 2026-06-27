@@ -39,6 +39,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 // ===== Logging =====
 fn log_event(msg: &str) {
     use std::io::Write;
+    // Write to log file with timestamp
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(dir) = exe_path.parent() {
             let log_path = dir.join("app.log");
@@ -52,6 +53,8 @@ fn log_event(msg: &str) {
             }
         }
     }
+    // Also print to console
+    eprintln!("{}", msg);
 }
 
 /// Create a green version of the original icon (white lines become green).
@@ -179,17 +182,12 @@ fn set_autostart_state(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("schtasks create failed: {}", err).into());
         }
         log_event(&format!("Autostart enabled (user {})", username));
-        eprintln!(
-            "✅ Autostart enabled (task as user {} with interactive session)",
-            username
-        );
     } else {
         let _ = std::process::Command::new("schtasks")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["/delete", "/tn", TASK_NAME, "/f"])
             .output();
         log_event("Autostart disabled");
-        eprintln!("✅ Autostart disabled");
     }
     Ok(())
 }
@@ -414,37 +412,14 @@ fn create_progress_icon(original_rgba: &[u8], width: u32, height: u32, progress:
     tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create progress icon")
 }
 
-macro_rules! log_line {
-    ($file:expr, $($arg:tt)*) => {{
-        use std::io::Write;
-        writeln!($file, $($arg)*)?;
-        $file.flush()?;
-    }};
-}
-
 async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let exe_path = std::env::current_exe()?;
-    let exe_dir = exe_path.parent().ok_or("No exe dir")?;
-    let log_path = exe_dir.join("install.log");
-    let mut log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(true)
-        .open(&log_path)?;
-
-    log_line!(log_file, "=== Install started for app: {} ===", app_name);
+    log_event(&format!("=== Install started for app: {} ===", app_name));
 
     let has_winget = is_winget_available();
     let has_choco = is_choco_available();
     let has_scoop = is_scoop_available();
 
-    log_line!(
-        log_file,
-        "Has winget: {}, choco: {}, scoop: {}",
-        has_winget,
-        has_choco,
-        has_scoop
-    );
+    log_event(&format!("Has winget: {}, choco: {}, scoop: {}", has_winget, has_choco, has_scoop));
 
     let methods: Vec<(&str, Box<dyn Fn() -> tokio::process::Command + Send + Sync>)> = vec![
         (
@@ -504,71 +479,79 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
             _ => false,
         };
         if !available {
-            log_line!(log_file, "Method {} not available, skipping.", name);
+            log_event(&format!("Method {} not available, skipping.", name));
             continue;
         }
 
-        log_line!(log_file, "Attempting install via {}", name);
+        log_event(&format!("Attempting install via {}", name));
         let mut child = match cmd_builder().spawn() {
             Ok(c) => c,
             Err(e) => {
-                log_line!(log_file, "Failed to spawn {}: {}", name, e);
+                log_event(&format!("Failed to spawn {}: {}", name, e));
                 continue;
             }
         };
 
-        log_line!(log_file, "{} spawned, waiting for completion...", name);
+        log_event(&format!("{} spawned, waiting for completion...", name));
 
         let output =
             match tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await {
                 Ok(Ok(out)) => out,
                 Ok(Err(e)) => {
-                    log_line!(log_file, "{} wait error: {}", name, e);
+                    log_event(&format!("{} wait error: {}", name, e));
                     continue;
                 }
                 Err(_) => {
-                    log_line!(
-                        log_file,
-                        "{} timed out after 60 seconds, skipping to next method.",
-                        name
-                    );
+                    log_event(&format!("{} timed out after 60 seconds, skipping to next method.", name));
                     continue;
                 }
             };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log_line!(log_file, "=== {} stdout ===\n{}", name, stdout);
-        log_line!(log_file, "=== {} stderr ===\n{}", name, stderr);
-        log_line!(
-            log_file,
-            "Exit code: {}",
-            output.status.code().unwrap_or(-1)
-        );
+        log_event(&format!("=== {} stdout ===\n{}", name, stdout));
+        log_event(&format!("=== {} stderr ===\n{}", name, stderr));
+        log_event(&format!("Exit code: {}", output.status.code().unwrap_or(-1)));
 
         if output.status.success() {
-            log_line!(log_file, "{} succeeded, searching for binary...", name);
+            log_event(&format!("{} succeeded, searching for binary...", name));
             if let Some(path) = find_app_binary(app_name) {
-                log_line!(log_file, "Found binary at: {}", path);
+                log_event(&format!("Found binary at: {}", path));
                 return Ok(path);
             } else {
-                log_line!(log_file, "Binary not found after {} install.", name);
+                log_event(&format!("Binary not found after {} install.", name));
             }
         } else {
-            log_line!(log_file, "{} failed with non-zero exit code.", name);
+            log_event(&format!("{} failed with non-zero exit code.", name));
         }
     }
 
-    log_line!(log_file, "All installation methods failed.");
+    log_event("All installation methods failed.");
     Err("No installation method succeeded".into())
 }
 
 // ===== Main entry point =====
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Write an empty line to separate log sessions (without timestamp)
+    {
+        use std::io::Write;
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                let log_path = dir.join("app.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(file, "");
+                }
+            }
+        }
+    }
+
     let pid = std::process::id();
     log_event(&format!("=== Rust Box started (PID: {}) ===", pid));
-    eprintln!("=== Rust Box started (PID: {}) ===", pid);
 
     // --- Set current directory to the executable's directory (release only) ---
     if cfg!(not(debug_assertions)) {
@@ -577,12 +560,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {
             if let Err(e) = std::env::set_current_dir(&exe_dir) {
-                let msg = format!("Could not set CWD: {}", e);
-                log_event(&msg);
-                eprintln!("Warning: {}", msg);
+                log_event(&format!("Could not set CWD: {}", e));
             } else {
                 log_event(&format!("CWD set to: {:?}", exe_dir));
-                eprintln!("CWD set to: {:?}", exe_dir);
             }
         }
     }
@@ -590,9 +570,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = match Config::load_or_create_default() {
         Ok(c) => c,
         Err(e) => {
-            let msg = format!("Config error: {:?}", e);
-            log_event(&msg);
-            eprintln!("{}", msg);
+            log_event(&format!("Config error: {}", e));
+            eprintln!("{}", e);
             process::exit(1);
         }
     };
@@ -601,7 +580,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = config.cfg_path.as_ref().unwrap().clone();
 
     log_event(&format!("Config loaded: app_path='{}', cfg_path='{}'", app_path, cfg_path));
-    eprintln!("Config loaded: app_path='{}', cfg_path='{}'", app_path, cfg_path);
 
     let file_stem = Path::new(&app_path)
         .file_stem()
@@ -617,8 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg_path_for_gui = Arc::new(Mutex::new(cfg_path.clone()));
 
-    eprintln!("Startup: killing any existing {} processes", app_name);
-    log_event(&format!("Startup cleanup: killing any existing {} processes", app_name));
+    log_event(&format!("Startup: killing any existing {} processes", app_name));
     let _ = Command::new("taskkill")
         .creation_flags(CREATE_NO_WINDOW)
         .args(["/F", "/IM", &app_name])
@@ -643,7 +620,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_exists = Path::new(&cfg_path).exists();
 
     log_event(&format!("Startup state: app_installed={}, cfg_exists={}", app_installed, cfg_exists));
-    eprintln!("Startup state: app_installed={}, cfg_exists={}", app_installed, cfg_exists);
 
     // Menu items with emojis
     let start_menu_item = MenuItem::new(
@@ -705,7 +681,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     log_event("Tray icon created and menu built");
-    eprintln!("Tray icon created and menu built");
 
     // Channels
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ChildCommand>();
@@ -759,7 +734,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ChildCommand::UpdateConfigPath(new_path) => {
                             current_cfg_path = new_path.clone();
                             log_event(&format!("Config path updated in manager to: {}", new_path));
-                            eprintln!("Config path updated in manager to: {}", new_path);
                         }
                         ChildCommand::Install => {
                             let app_name = Path::new(&current_app_path)
@@ -805,9 +779,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         ChildCommand::Start => {
                             if !std::path::Path::new(&current_app_path).exists() {
-                                let msg = format!("ERROR: Application not found at: {}", current_app_path);
-                                log_event(&msg);
-                                eprintln!("{}", msg);
+                                log_event(&format!("ERROR: Application not found at: {}", current_app_path));
                                 if !auto_start_pending {
                                     let _ = gui_tx.send(false);
                                 }
@@ -815,9 +787,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if !std::path::Path::new(&current_cfg_path).exists() {
-                                let msg = format!("ERROR: Config file not found: {}", current_cfg_path);
-                                log_event(&msg);
-                                eprintln!("{}", msg);
+                                log_event(&format!("ERROR: Config file not found: {}", current_cfg_path));
                                 if !auto_start_pending {
                                     let _ = gui_tx.send(false);
                                 }
@@ -826,7 +796,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if child_pid.is_none() {
                                 log_event(&format!("Starting child: {} with config {}", current_app_path, current_cfg_path));
-                                eprintln!("Starting child: {} with config {}", current_app_path, current_cfg_path);
 
                                 // Start rain animation (send command to GUI)
                                 let _ = icon_tx.send(IconCommand::StartRain);
@@ -877,16 +846,13 @@ if ($adapter) {
                                     r#"$p = Start-Process -FilePath "{}" -ArgumentList "run","-c","{}" -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ $p.Id }}"#,
                                     current_app_path, current_cfg_path
                                 );
-                                eprintln!("Launching: {} with config: {}", current_app_path, current_cfg_path);
-                                eprintln!("PowerShell command: {}", ps_script);
+                                log_event(&format!("Launching: {} with config: {}", current_app_path, current_cfg_path));
 
                                 // Create a process group to ensure termination
                                 let group = match ProcessGroup::new() {
                                     Ok(g) => g,
                                     Err(e) => {
-                                        let msg = format!("Failed to create ProcessGroup: {}", e);
-                                        log_event(&msg);
-                                        eprintln!("{}", msg);
+                                        log_event(&format!("Failed to create ProcessGroup: {}", e));
                                         if !auto_start_pending {
                                             let _ = gui_tx.send(false);
                                         }
@@ -904,9 +870,7 @@ if ($adapter) {
                                 let mut child = match cmd.spawn() {
                                     Ok(c) => c,
                                     Err(e) => {
-                                        let msg = format!("Failed to spawn child: {}", e);
-                                        log_event(&msg);
-                                        eprintln!("{}", msg);
+                                        log_event(&format!("Failed to spawn child: {}", e));
                                         if !auto_start_pending {
                                             let _ = gui_tx.send(false);
                                         }
@@ -916,9 +880,7 @@ if ($adapter) {
 
                                 // Adopt the child into the process group (so it gets killed on main exit)
                                 if let Err(e) = group.adopt(&mut child) {
-                                    let msg = format!("Failed to adopt child into group: {}", e);
-                                    log_event(&msg);
-                                    eprintln!("{}", msg);
+                                    log_event(&format!("Failed to adopt child into group: {}", e));
                                     // Continue anyway – process is still running
                                 }
 
@@ -933,19 +895,17 @@ if ($adapter) {
                                 let _ = child.wait().await;
 
                                 if !stderr.is_empty() {
-                                    eprintln!("PowerShell stderr: {}", stderr);
+                                    log_event(&format!("PowerShell stderr: {}", stderr));
                                 }
 
                                 let pid_str = stdout.trim();
-                                eprintln!("PowerShell stdout: '{}'", pid_str);
+                                log_event(&format!("PowerShell stdout: '{}'", pid_str));
 
                                 if let Ok(pid) = pid_str.parse::<u32>() {
                                     // Use is_process_alive to verify
                                     if !is_process_alive(pid) {
                                         // Process died immediately
-                                        let msg = format!("Child process {} died immediately", pid);
-                                        log_event(&msg);
-                                        eprintln!("{}", msg);
+                                        log_event(&format!("Child process {} died immediately", pid));
 
                                         if auto_start_pending {
                                             // Progressive retry: 2, 4, 6, 8, 10 seconds
@@ -953,7 +913,6 @@ if ($adapter) {
                                             auto_start_attempts += 1;
                                             if auto_start_attempts < 5 {
                                                 log_event(&format!("Auto-start attempt {} failed, retrying in {} seconds...", auto_start_attempts, delay_secs));
-                                                eprintln!("Auto-start attempt {} failed, retrying in {} seconds...", auto_start_attempts, delay_secs);
                                                 let cmd_tx_retry = cmd_tx_clone.clone();
                                                 tokio::spawn(async move {
                                                     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -991,18 +950,14 @@ if ($adapter) {
                                         let _ = icon_tx_delayed.send(IconCommand::StopRain);
                                     });
                                     log_event(&format!("Child process started successfully (PID: {})", pid));
-                                    eprintln!("Started child PID: {}", pid);
                                     let _ = gui_tx.send(true);
                                 } else {
-                                    let msg = format!("Failed to parse PID from stdout: '{}'", pid_str);
-                                    log_event(&msg);
-                                    eprintln!("{}", msg);
+                                    log_event(&format!("Failed to parse PID from stdout: '{}'", pid_str));
                                     if auto_start_pending {
                                         let delay_secs = 2 + (auto_start_attempts * 2);
                                         auto_start_attempts += 1;
                                         if auto_start_attempts < 5 {
                                             log_event(&format!("Auto-start attempt {} failed (no PID), retrying in {} seconds...", auto_start_attempts, delay_secs));
-                                            eprintln!("Auto-start attempt {} failed (no PID), retrying in {} seconds...", auto_start_attempts, delay_secs);
                                             let cmd_tx_retry = cmd_tx_clone.clone();
                                             tokio::spawn(async move {
                                                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -1026,7 +981,6 @@ if ($adapter) {
                         }
                         ChildCommand::Stop => {
                             log_event("Stopping child process...");
-                            eprintln!("Stopping child process...");
 
                             // Start glitch animation
                             let _ = icon_tx.send(IconCommand::Glitch);
@@ -1059,7 +1013,7 @@ if ($adapter) {
                             // Also kill via process group
                             if let Some(group) = process_group.take() {
                                 drop(group);
-                                eprintln!("ProcessGroup dropped");
+                                log_event("ProcessGroup dropped");
                             }
                             if let Some(mut child) = child_handle.take() {
                                 let _ = child.kill().await;
@@ -1067,7 +1021,7 @@ if ($adapter) {
                             }
 
                             // Kill by name as fallback
-                            eprintln!("Stop: killing all {} processes", current_app_name);
+                            log_event(&format!("Stop: killing all {} processes", current_app_name));
                             let _ = Command::new("taskkill")
                                 .creation_flags(CREATE_NO_WINDOW)
                                 .args(["/F", "/IM", &current_app_name])
@@ -1090,7 +1044,6 @@ if ($adapter) {
                             // Stop glitch and restore default icon
                             let _ = icon_tx.send(IconCommand::StopGlitch);
                             log_event("Child process stopped.");
-                            eprintln!("Stop completed, all processes cleaned up");
                             let _ = gui_tx.send(false);
                         }
                     }
@@ -1100,9 +1053,7 @@ if ($adapter) {
                         let sys = System::new_all();
                         let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
                         if !still_running {
-                            let msg = format!("Child process (PID {}) terminated unexpectedly", pid);
-                            log_event(&msg);
-                            eprintln!("{}", msg);
+                            log_event(&format!("Child process (PID {}) terminated unexpectedly", pid));
                             child_pid = None;
                             process_group.take();
                             child_handle.take();
@@ -1129,7 +1080,6 @@ if ($adapter) {
 
     if autostart_initial && app_installed && cfg_exists {
         log_event("Auto-start enabled: starting child automatically");
-        eprintln!("Auto-start enabled: starting child automatically");
         let _ = cmd_tx.send(ChildCommand::AutoStart);
     }
 
@@ -1187,7 +1137,7 @@ if ($adapter) {
                     let _ = config_app_item.set_enabled(true);
                     let _ = autostart_item.set_enabled(true);
                     app_installed_flag.store(true, Ordering::SeqCst);
-                    eprintln!("✅ App installed at: {}", path);
+                    log_event(&format!("✅ App installed at: {}", path));
                 }
                 InstallStatus::Failed { app_name, error } => {
                     log_event(&format!("Installation failed for {}: {}", app_name, error));
@@ -1197,7 +1147,7 @@ if ($adapter) {
                     }
                     let _ = start_menu_item.set_text(format!("⤵ Install [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
-                    eprintln!("❌ Installation failed: {}", error);
+                    log_event(&format!("❌ Installation failed: {}", error));
                 }
             }
         }
@@ -1305,7 +1255,6 @@ if ($adapter) {
                     // installed but no config
                     let msg = "Application installed, but config file missing. Please select config.";
                     log_event(msg);
-                    eprintln!("{}", msg);
                     #[cfg(windows)]
                     unsafe {
                         let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
@@ -1330,18 +1279,15 @@ if ($adapter) {
                             "Auto-start: ON-[OFF]"
                         };
                         let _ = autostart_item.set_text(text);
-                        eprintln!("Autostart set to {}", new_state);
+                        log_event(&format!("Autostart set to {}", new_state));
                     }
                     Err(e) => {
-                        let msg = format!("Failed to change autostart: {}", e);
-                        log_event(&msg);
-                        eprintln!("{}", msg);
+                        log_event(&format!("Failed to change autostart: {}", e));
                         #[cfg(windows)]
                         unsafe {
-                            let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+                            let msg_utf16: Vec<u16> = e.to_string().encode_utf16().chain(Some(0)).collect();
                             let title = "Rust Box - Error";
-                            let title_utf16: Vec<u16> =
-                                title.encode_utf16().chain(Some(0)).collect();
+                            let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
                             MessageBoxW(
                                 null_mut(),
                                 msg_utf16.as_ptr(),
@@ -1380,12 +1326,10 @@ if ($adapter) {
                     if let Some(selected) = show_config_file_dialog() {
                         log_event(&format!("User selected config file: {}", selected));
                         if let Err(e) = Config::update_cfg_path(&selected) {
-                            let msg = format!("Failed to update cfg_path: {}", e);
-                            log_event(&msg);
-                            eprintln!("{}", msg);
+                            log_event(&format!("Failed to update cfg_path: {}", e));
                             #[cfg(windows)]
                             unsafe {
-                                let msg_utf16: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+                                let msg_utf16: Vec<u16> = e.to_string().encode_utf16().chain(Some(0)).collect();
                                 let title = "Rust Box - Error";
                                 let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
                                 MessageBoxW(
@@ -1463,12 +1407,10 @@ if ($adapter) {
 
     // Final cleanup
     log_event("Main exit: sending stop command and aborting manager");
-    eprintln!("Main exit: sending stop command and aborting manager");
     let _ = cmd_tx.send(ChildCommand::Stop);
     tokio::time::sleep(Duration::from_millis(500)).await;
     manager_handle.abort();
 
     log_event("=== Rust Box terminated ===");
-    eprintln!("=== Rust Box terminated ===");
     Ok(())
 }

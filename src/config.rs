@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write, Error as IoError};
+use std::path::Path;
 use std::env;
 use base64::decode;
 
@@ -43,23 +44,34 @@ pub enum ConfigError {
     MissingField(String),
 }
 
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::IoError(e) => write!(f, "I/O error: {}", e),
+            ConfigError::ParseError(s) => write!(f, "Parse error: {}", s),
+            ConfigError::MissingField(s) => write!(f, "Missing field: {}", s),
+        }
+    }
+}
+
 impl Config {
     fn new(app_path: Option<String>, cfg_path: Option<String>) -> Self {
         Self { app_path, cfg_path }
     }
 
     pub fn load_from_path(path: &str) -> Result<Self, ConfigError> {
-        Self::load_config(path)
-    }
-
-    pub fn load_or_create_default() -> Result<Self, ConfigError> {
-        let config_path = Self::ensure_config_file().map_err(|e| ConfigError::IoError(IoError::new(std::io::ErrorKind::Other, e)))?;
-        Self::load_from_path(&config_path.to_string_lossy())
+        let file = File::open(path).map_err(ConfigError::IoError)?;
+        let cfg = Self::from_reader(&mut BufReader::new(file))?;
+        cfg.check_required()?;
+        Ok(cfg)
     }
 
     pub fn ensure_config_file() -> Result<std::path::PathBuf, String> {
         let exe_path = env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
         let exe_dir = exe_path.parent().ok_or("No exe dir")?;
+        if let Err(e) = std::fs::create_dir_all(exe_dir) {
+            eprintln!("Warning: could not create exe directory: {}", e);
+        }
         let config_path = exe_dir.join(DEFAULT_CONFIG_NAME);
         if !config_path.exists() {
             let default = DefaultConfig::new()?;
@@ -70,11 +82,9 @@ impl Config {
         Ok(config_path)
     }
 
-    fn load_config(file_path: &str) -> Result<Self, ConfigError> {
-        let file = File::open(file_path).map_err(ConfigError::IoError)?;
-        let cfg = Self::from_reader(&mut BufReader::new(file))?;
-        cfg.check_required()?;
-        Ok(cfg)
+    pub fn load_or_create_default() -> Result<Self, ConfigError> {
+        let config_path = Self::ensure_config_file().map_err(|e| ConfigError::IoError(IoError::new(std::io::ErrorKind::Other, e)))?;
+        Self::load_from_path(&config_path.to_string_lossy())
     }
 
     fn from_reader<R: BufRead>(reader: R) -> Result<Self, ConfigError> {
@@ -147,6 +157,27 @@ impl Config {
         }
         if !found {
             lines.push(format!("cfg_path={}", new_path));
+        }
+        std::fs::write(&config_path, lines.join("\n"))?;
+        Ok(())
+    }
+
+    pub fn update_app_path(new_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let exe_path = env::current_exe()?;
+        let exe_dir = exe_path.parent().ok_or("No exe dir")?;
+        let config_path = exe_dir.join(DEFAULT_CONFIG_NAME);
+        let content = std::fs::read_to_string(&config_path)?;
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let mut found = false;
+        for line in &mut lines {
+            if line.starts_with("app_path=") {
+                *line = format!("app_path={}", new_path);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            lines.push(format!("app_path={}", new_path));
         }
         std::fs::write(&config_path, lines.join("\n"))?;
         Ok(())
