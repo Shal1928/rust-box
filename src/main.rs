@@ -3,7 +3,7 @@
 mod config;
 
 use std::env;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::Path;
 use std::process;
 use std::process::Stdio;
@@ -111,15 +111,11 @@ enum DialogCommand {
 }
 
 enum IconCommand {
-    Progress(u8),
     Restore,
     StartRain,
     StopRain,
     Glitch,
     StopGlitch,
-    SetGreen,
-    SetRainFrame(tray_icon::Icon),
-    SetGlitchFrame(tray_icon::Icon),
 }
 
 // ===== Auto-start via Task Scheduler =====
@@ -378,40 +374,6 @@ fn show_config_file_dialog() -> Option<String> {
         .and_then(|p| p.to_str().map(|s| s.to_string()))
 }
 
-// ===== Progress icon =====
-fn create_progress_icon(original_rgba: &[u8], width: u32, height: u32, progress: u8) -> tray_icon::Icon {
-    let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
-        .expect("Failed to create RgbaImage from original data");
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = img.get_pixel_mut(x, y);
-            let [r, g, b, a] = pixel.0;
-            if a == 0 { continue; }
-            let gray = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
-            *pixel = Rgba([gray, gray, gray, a]);
-        }
-    }
-
-    let fill_height = (height as f32 * (progress as f32 / 100.0)) as u32;
-    if fill_height > 0 {
-        for y in (height - fill_height)..height {
-            for x in 0..width {
-                let pixel = img.get_pixel_mut(x, y);
-                let [r, g, b, a] = pixel.0;
-                let blend = 0.5;
-                let new_r = (r as f32 * (1.0 - blend) + 0.0) as u8;
-                let new_g = (g as f32 * (1.0 - blend) + 0.0) as u8;
-                let new_b = (b as f32 * (1.0 - blend) + 255.0 * blend) as u8;
-                *pixel = Rgba([new_r, new_g, new_b, a]);
-            }
-        }
-    }
-
-    let (w, h) = img.dimensions();
-    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create progress icon")
-}
-
 async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error>> {
     log_event(&format!("=== Install started for app: {} ===", app_name));
 
@@ -484,7 +446,7 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
         }
 
         log_event(&format!("Attempting install via {}", name));
-        let mut child = match cmd_builder().spawn() {
+        let child = match cmd_builder().spawn() {
             Ok(c) => c,
             Err(e) => {
                 log_event(&format!("Failed to spawn {}: {}", name, e));
@@ -692,7 +654,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Separate clones for different contexts
     let icon_cmd_tx_for_manager = icon_cmd_tx.clone();
     let icon_cmd_tx_gui = icon_cmd_tx.clone();
-    let icon_cmd_tx_anim = icon_cmd_tx.clone();
+    let _icon_cmd_tx_anim = icon_cmd_tx.clone();
 
     let tray_event_rx = TrayIconEvent::receiver();
     let menu_event_rx = MenuEvent::receiver();
@@ -1088,7 +1050,7 @@ if ($adapter) {
     let cmd_tx_main = cmd_tx.clone();
     let cmd_tx_main_clone = cmd_tx_main.clone();
     let app_installed_flag = Arc::new(AtomicBool::new(app_installed));
-    let app_installed_flag_gui = app_installed_flag.clone();
+    let _app_installed_flag_gui = app_installed_flag.clone();
 
     // Animation state (no threads)
     enum AnimMode {
@@ -1118,20 +1080,11 @@ if ($adapter) {
                     log_event(&format!("Installation started for {}", app_name));
                     let _ = start_menu_item.set_text(format!("Installing [{}]...", app_name));
                     let _ = start_menu_item.set_enabled(false);
-                    // Start progress animation
-                    if let AnimMode::Off = anim_mode {
-                        anim_mode = AnimMode::Rain { start: Instant::now(), toggle: false };
-                        // We'll handle progress separately – for now just set first frame
-                        let progress_icon = create_progress_icon(&orig_rgba, width, height, 0);
-                        let _ = tray_icon.set_icon(Some(progress_icon));
-                    }
+                    // No progress animation – we use Rain animation for start/stop only
                 }
                 InstallStatus::Installed { path, app_name } => {
                     log_event(&format!("Installation completed: {} at {}", app_name, path));
-                    if let AnimMode::Rain { .. } = anim_mode {
-                        anim_mode = AnimMode::Off;
-                        let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
-                    }
+                    let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
                     let _ = start_menu_item.set_text(format!("▶ Start [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
                     let _ = config_app_item.set_enabled(true);
@@ -1141,10 +1094,7 @@ if ($adapter) {
                 }
                 InstallStatus::Failed { app_name, error } => {
                     log_event(&format!("Installation failed for {}: {}", app_name, error));
-                    if let AnimMode::Rain { .. } = anim_mode {
-                        anim_mode = AnimMode::Off;
-                        let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
-                    }
+                    let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
                     let _ = start_menu_item.set_text(format!("⤵ Install [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
                     log_event(&format!("❌ Installation failed: {}", error));
@@ -1155,11 +1105,6 @@ if ($adapter) {
         // Handle icon commands
         while let Ok(cmd) = icon_cmd_rx.try_recv() {
             match cmd {
-                IconCommand::Progress(p) => {
-                    // For progress animation, we handle it separately, but also accept command
-                    let progress_icon = create_progress_icon(&orig_rgba, width, height, p);
-                    let _ = tray_icon.set_icon(Some(progress_icon));
-                }
                 IconCommand::Restore => {
                     anim_mode = AnimMode::Off;
                     let _ = tray_icon.set_icon(Some(icon.clone()));
@@ -1188,16 +1133,6 @@ if ($adapter) {
                 IconCommand::StopGlitch => {
                     anim_mode = AnimMode::Off;
                     let _ = tray_icon.set_icon(Some(icon.clone()));
-                }
-                IconCommand::SetGreen => {
-                    let green_icon_local = create_green_icon(&orig_rgba, width, height);
-                    let _ = tray_icon.set_icon(Some(green_icon_local));
-                }
-                IconCommand::SetRainFrame(icon_frame) => {
-                    let _ = tray_icon.set_icon(Some(icon_frame));
-                }
-                IconCommand::SetGlitchFrame(icon_frame) => {
-                    let _ = tray_icon.set_icon(Some(icon_frame));
                 }
             }
         }

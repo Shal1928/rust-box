@@ -1,8 +1,8 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write, Error as IoError};
-use std::path::Path;
 use std::env;
-use base64::decode;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 
 const DEFAULT_CONFIG_NAME: &str = "rust-box.cfg";
 
@@ -10,7 +10,7 @@ const DEFAULT_APP_PATH: &str = "c2luZy1ib3g=";
 const DEFAULT_CFG_PATH: &str = "Y29uZmlnLmpzb24=";
 
 fn decode_b64(s: &str) -> Result<String, String> {
-    let bytes = decode(s).map_err(|e| format!("Base64 decode error: {}", e))?;
+    let bytes = STANDARD.decode(s.as_bytes()).map_err(|e| format!("Base64 decode error: {}", e))?;
     String::from_utf8(bytes).map_err(|e| format!("UTF-8 decode error: {}", e))
 }
 
@@ -157,27 +157,6 @@ impl Config {
         }
         if !found {
             lines.push(format!("cfg_path={}", new_path));
-        }
-        std::fs::write(&config_path, lines.join("\n"))?;
-        Ok(())
-    }
-
-    pub fn update_app_path(new_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let exe_path = env::current_exe()?;
-        let exe_dir = exe_path.parent().ok_or("No exe dir")?;
-        let config_path = exe_dir.join(DEFAULT_CONFIG_NAME);
-        let content = std::fs::read_to_string(&config_path)?;
-        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-        let mut found = false;
-        for line in &mut lines {
-            if line.starts_with("app_path=") {
-                *line = format!("app_path={}", new_path);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            lines.push(format!("app_path={}", new_path));
         }
         std::fs::write(&config_path, lines.join("\n"))?;
         Ok(())
