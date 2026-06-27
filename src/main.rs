@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::os::windows::process::CommandExt;
 
 use chrono::Local;
@@ -36,18 +36,6 @@ use crate::config::Config;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-// ===== Timing constants (tunable) – currently commented out =====
-// const TIMEOUT_START_TASKKILL: Duration = Duration::from_secs(2);
-// const TIMEOUT_START_PID_KILL: Duration = Duration::from_millis(200);
-// const TIMEOUT_START_SPAWN_WAIT: Duration = Duration::from_millis(200);
-// const TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS: usize = 10;
-// const TIMEOUT_STOP_POST_TASKKILL: Duration = Duration::from_secs(2);
-// const TIMEOUT_STOP_FINAL_RESOURCE_RELEASE: Duration = Duration::from_secs(3);
-// const TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS: usize = 15;
-// const TIMEOUT_STARTUP_CLEANUP: Duration = Duration::from_secs(1);
-// const TIMEOUT_RELOAD_SLEEP: Duration = Duration::from_secs(2);
-// const RETRY_DELAY_BASE_SECS: u64 = 2;
-
 // ===== Logging =====
 fn log_event(msg: &str) {
     use std::io::Write;
@@ -64,6 +52,25 @@ fn log_event(msg: &str) {
             }
         }
     }
+}
+
+/// Create a green version of the original icon (white lines become green).
+fn create_green_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
+    let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
+        .expect("Failed to create RgbaImage");
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel_mut(x, y);
+            let [r, g, b, a] = pixel.0;
+            if a == 0 { continue; }
+            if r > 200 && g > 200 && b > 200 {
+                *pixel = Rgba([0, 255, 0, a]);
+            }
+        }
+    }
+    let (w, h) = img.dimensions();
+    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create green icon")
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -103,6 +110,13 @@ enum DialogCommand {
 enum IconCommand {
     Progress(u8),
     Restore,
+    StartRain,
+    StopRain,
+    Glitch,
+    StopGlitch,
+    SetGreen,
+    SetRainFrame(tray_icon::Icon),
+    SetGlitchFrame(tray_icon::Icon),
 }
 
 // ===== Auto-start via Task Scheduler =====
@@ -371,7 +385,6 @@ fn create_progress_icon(original_rgba: &[u8], width: u32, height: u32, progress:
     let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
         .expect("Failed to create RgbaImage from original data");
 
-    // Convert to grayscale
     for y in 0..height {
         for x in 0..width {
             let pixel = img.get_pixel_mut(x, y);
@@ -382,7 +395,6 @@ fn create_progress_icon(original_rgba: &[u8], width: u32, height: u32, progress:
         }
     }
 
-    // Fill from bottom with blue
     let fill_height = (height as f32 * (progress as f32 / 100.0)) as u32;
     if fill_height > 0 {
         for y in (height - fill_height)..height {
@@ -556,6 +568,7 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid = std::process::id();
     log_event(&format!("=== Rust Box started (PID: {}) ===", pid));
+    eprintln!("=== Rust Box started (PID: {}) ===", pid);
 
     // --- Set current directory to the executable's directory (release only) ---
     if cfg!(not(debug_assertions)) {
@@ -588,6 +601,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = config.cfg_path.as_ref().unwrap().clone();
 
     log_event(&format!("Config loaded: app_path='{}', cfg_path='{}'", app_path, cfg_path));
+    eprintln!("Config loaded: app_path='{}', cfg_path='{}'", app_path, cfg_path);
 
     let file_stem = Path::new(&app_path)
         .file_stem()
@@ -610,7 +624,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args(["/F", "/IM", &app_name])
         .output()
         .await;
-    // tokio::time::sleep(TIMEOUT_STARTUP_CLEANUP).await; // commented out
 
     // Load tray icon
     let icon_bytes = include_bytes!("../rust-box.png");
@@ -630,6 +643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_exists = Path::new(&cfg_path).exists();
 
     log_event(&format!("Startup state: app_installed={}, cfg_exists={}", app_installed, cfg_exists));
+    eprintln!("Startup state: app_installed={}, cfg_exists={}", app_installed, cfg_exists);
 
     // Menu items with emojis
     let start_menu_item = MenuItem::new(
@@ -691,6 +705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     log_event("Tray icon created and menu built");
+    eprintln!("Tray icon created and menu built");
 
     // Channels
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ChildCommand>();
@@ -698,6 +713,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (gui_tx, mut gui_rx) = mpsc::unbounded_channel::<bool>();
     let (dialog_tx, mut dialog_rx) = mpsc::unbounded_channel::<DialogCommand>();
     let (icon_cmd_tx, mut icon_cmd_rx) = mpsc::unbounded_channel::<IconCommand>();
+
+    // Separate clones for different contexts
+    let icon_cmd_tx_for_manager = icon_cmd_tx.clone();
+    let icon_cmd_tx_gui = icon_cmd_tx.clone();
+    let icon_cmd_tx_anim = icon_cmd_tx.clone();
 
     let tray_event_rx = TrayIconEvent::receiver();
     let menu_event_rx = MenuEvent::receiver();
@@ -714,10 +734,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let app_path_clone = resolved_app_path.clone();
 
-    // Animation control
-    let animation_running = Arc::new(AtomicBool::new(false));
-    let animation_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    let icon_cmd_tx_clone = icon_cmd_tx.clone();
+    // Animation state (no threads)
+    let green_icon = create_green_icon(&orig_rgba, width, height);
 
     // --- Manager task ---
     let manager_handle = tokio::spawn(async move {
@@ -731,6 +749,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut auto_start_attempts = 0;
         let mut auto_start_pending = false;
 
+        // Clone for use inside loop
+        let icon_tx = icon_cmd_tx_for_manager.clone();
+
         loop {
             tokio::select! {
                 Some(cmd) = cmd_rx.recv() => {
@@ -738,7 +759,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ChildCommand::UpdateConfigPath(new_path) => {
                             current_cfg_path = new_path.clone();
                             log_event(&format!("Config path updated in manager to: {}", new_path));
-                            eprintln!("Config path updated to: {}", current_cfg_path);
+                            eprintln!("Config path updated in manager to: {}", new_path);
                         }
                         ChildCommand::Install => {
                             let app_name = Path::new(&current_app_path)
@@ -787,7 +808,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = format!("ERROR: Application not found at: {}", current_app_path);
                                 log_event(&msg);
                                 eprintln!("{}", msg);
-                                // Notify GUI that start failed (if not auto-start)
                                 if !auto_start_pending {
                                     let _ = gui_tx.send(false);
                                 }
@@ -806,7 +826,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if child_pid.is_none() {
                                 log_event(&format!("Starting child: {} with config {}", current_app_path, current_cfg_path));
-                                eprintln!("Start: killing all {} processes", current_app_name);
+                                eprintln!("Starting child: {} with config {}", current_app_path, current_cfg_path);
+
+                                // Start rain animation (send command to GUI)
+                                let _ = icon_tx.send(IconCommand::StartRain);
 
                                 // Kill any existing process by name
                                 let _ = Command::new("taskkill")
@@ -814,7 +837,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .args(["/F", "/IM", &current_app_name])
                                     .output()
                                     .await;
-                                // tokio::time::sleep(TIMEOUT_START_TASKKILL).await; // commented out
 
                                 // Also kill by PID if we had one
                                 if let Some(pid) = child_pid {
@@ -823,7 +845,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .args(["/F", "/PID", &pid.to_string()])
                                         .output()
                                         .await;
-                                    // tokio::time::sleep(TIMEOUT_START_PID_KILL).await; // commented out
                                     child_pid = None;
                                 }
 
@@ -901,8 +922,6 @@ if ($adapter) {
                                     // Continue anyway – process is still running
                                 }
 
-                                // tokio::time::sleep(TIMEOUT_START_SPAWN_WAIT).await; // commented out
-
                                 let mut stdout = String::new();
                                 let mut stderr = String::new();
                                 if let Some(mut out) = child.stdout.take() {
@@ -934,6 +953,7 @@ if ($adapter) {
                                             auto_start_attempts += 1;
                                             if auto_start_attempts < 5 {
                                                 log_event(&format!("Auto-start attempt {} failed, retrying in {} seconds...", auto_start_attempts, delay_secs));
+                                                eprintln!("Auto-start attempt {} failed, retrying in {} seconds...", auto_start_attempts, delay_secs);
                                                 let cmd_tx_retry = cmd_tx_clone.clone();
                                                 tokio::spawn(async move {
                                                     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -949,7 +969,8 @@ if ($adapter) {
                                                 continue;
                                             }
                                         } else {
-                                            // normal start, just notify GUI of failure
+                                            // normal start, stop rain and restore icon
+                                            let _ = icon_tx.send(IconCommand::StopRain);
                                             let _ = gui_tx.send(false);
                                             continue;
                                         }
@@ -963,6 +984,12 @@ if ($adapter) {
                                     dialog_shown = false;
                                     auto_start_pending = false;
                                     auto_start_attempts = 0;
+                                    // Wait 5 seconds before stopping rain animation
+                                    let icon_tx_delayed = icon_tx.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                        let _ = icon_tx_delayed.send(IconCommand::StopRain);
+                                    });
                                     log_event(&format!("Child process started successfully (PID: {})", pid));
                                     eprintln!("Started child PID: {}", pid);
                                     let _ = gui_tx.send(true);
@@ -975,6 +1002,7 @@ if ($adapter) {
                                         auto_start_attempts += 1;
                                         if auto_start_attempts < 5 {
                                             log_event(&format!("Auto-start attempt {} failed (no PID), retrying in {} seconds...", auto_start_attempts, delay_secs));
+                                            eprintln!("Auto-start attempt {} failed (no PID), retrying in {} seconds...", auto_start_attempts, delay_secs);
                                             let cmd_tx_retry = cmd_tx_clone.clone();
                                             tokio::spawn(async move {
                                                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -989,6 +1017,7 @@ if ($adapter) {
                                             continue;
                                         }
                                     } else {
+                                        let _ = icon_tx.send(IconCommand::StopRain);
                                         let _ = gui_tx.send(false);
                                         continue;
                                     }
@@ -997,6 +1026,10 @@ if ($adapter) {
                         }
                         ChildCommand::Stop => {
                             log_event("Stopping child process...");
+                            eprintln!("Stopping child process...");
+
+                            // Start glitch animation
+                            let _ = icon_tx.send(IconCommand::Glitch);
 
                             // Try graceful shutdown first
                             if let Some(pid) = child_pid {
@@ -1006,7 +1039,7 @@ if ($adapter) {
                                     .output()
                                     .await;
                                 // Wait a few seconds for graceful exit
-                                for _ in 0..10 { // TIMEOUT_STOP_GRACEFUL_WAIT_ITERATIONS
+                                for _ in 0..10 {
                                     tokio::time::sleep(Duration::from_millis(250)).await;
                                     if !is_process_alive(pid) {
                                         break;
@@ -1040,23 +1073,22 @@ if ($adapter) {
                                 .args(["/F", "/IM", &current_app_name])
                                 .output()
                                 .await;
-                            // tokio::time::sleep(TIMEOUT_STOP_POST_TASKKILL).await; // commented out
 
                             // Wait for process to fully terminate
                             if let Some(pid) = child_pid {
-                                for _ in 0..15 { // TIMEOUT_STOP_WAIT_TERMINATE_ITERATIONS
+                                for _ in 0..15 {
                                     tokio::time::sleep(Duration::from_millis(100)).await;
                                     let sys = System::new_all();
                                     let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
                                     if !still_running { break; }
                                 }
                             }
-                            // Extra delay to release system resources (especially network/TUN)
-                            // tokio::time::sleep(TIMEOUT_STOP_FINAL_RESOURCE_RELEASE).await; // commented out
 
                             child_pid = None;
                             is_running_task.store(false, Ordering::SeqCst);
                             dialog_shown = false;
+                            // Stop glitch and restore default icon
+                            let _ = icon_tx.send(IconCommand::StopGlitch);
                             log_event("Child process stopped.");
                             eprintln!("Stop completed, all processes cleaned up");
                             let _ = gui_tx.send(false);
@@ -1108,13 +1140,21 @@ if ($adapter) {
     let app_installed_flag = Arc::new(AtomicBool::new(app_installed));
     let app_installed_flag_gui = app_installed_flag.clone();
 
+    // Animation state (no threads)
+    enum AnimMode {
+        Off,
+        Rain { start: Instant, toggle: bool },
+        Glitch { toggle: bool },
+    }
+    let mut anim_mode = AnimMode::Off;
+
     event_loop.run_on_demand(move |_event, window_target| {
         window_target.set_control_flow(ControlFlow::Wait);
 
         // Update Start/Stop button label from manager
         while let Ok(running) = gui_rx.try_recv() {
             let text = if running {
-                format!("⏹ Stop [{}]", &file_stem)
+                format!("◼ Stop [{}]", &file_stem)
             } else {
                 format!("▶ Start [{}]", &file_stem)
             };
@@ -1128,31 +1168,20 @@ if ($adapter) {
                     log_event(&format!("Installation started for {}", app_name));
                     let _ = start_menu_item.set_text(format!("Installing [{}]...", app_name));
                     let _ = start_menu_item.set_enabled(false);
-                    // Start animation
-                    if !animation_running.load(Ordering::SeqCst) {
-                        animation_running.store(true, Ordering::SeqCst);
-                        let running = animation_running.clone();
-                        let cmd_tx = icon_cmd_tx_clone.clone();
-                        let handle = std::thread::spawn(move || {
-                            let steps = [0, 25, 50, 75, 100];
-                            let mut step_idx = 0;
-                            while running.load(Ordering::SeqCst) {
-                                let _ = cmd_tx.send(IconCommand::Progress(steps[step_idx]));
-                                step_idx = (step_idx + 1) % steps.len();
-                                std::thread::sleep(Duration::from_millis(300));
-                            }
-                        });
-                        *animation_handle.lock().unwrap() = Some(handle);
+                    // Start progress animation
+                    if let AnimMode::Off = anim_mode {
+                        anim_mode = AnimMode::Rain { start: Instant::now(), toggle: false };
+                        // We'll handle progress separately – for now just set first frame
+                        let progress_icon = create_progress_icon(&orig_rgba, width, height, 0);
+                        let _ = tray_icon.set_icon(Some(progress_icon));
                     }
                 }
                 InstallStatus::Installed { path, app_name } => {
                     log_event(&format!("Installation completed: {} at {}", app_name, path));
-                    // Stop animation
-                    animation_running.store(false, Ordering::SeqCst);
-                    if let Some(h) = animation_handle.lock().unwrap().take() {
-                        let _ = h.join();
+                    if let AnimMode::Rain { .. } = anim_mode {
+                        anim_mode = AnimMode::Off;
+                        let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
                     }
-                    let _ = icon_cmd_tx.send(IconCommand::Restore);
                     let _ = start_menu_item.set_text(format!("▶ Start [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
                     let _ = config_app_item.set_enabled(true);
@@ -1162,12 +1191,10 @@ if ($adapter) {
                 }
                 InstallStatus::Failed { app_name, error } => {
                     log_event(&format!("Installation failed for {}: {}", app_name, error));
-                    // Stop animation
-                    animation_running.store(false, Ordering::SeqCst);
-                    if let Some(h) = animation_handle.lock().unwrap().take() {
-                        let _ = h.join();
+                    if let AnimMode::Rain { .. } = anim_mode {
+                        anim_mode = AnimMode::Off;
+                        let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
                     }
-                    let _ = icon_cmd_tx.send(IconCommand::Restore);
                     let _ = start_menu_item.set_text(format!("⤵ Install [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
                     eprintln!("❌ Installation failed: {}", error);
@@ -1179,16 +1206,83 @@ if ($adapter) {
         while let Ok(cmd) = icon_cmd_rx.try_recv() {
             match cmd {
                 IconCommand::Progress(p) => {
+                    // For progress animation, we handle it separately, but also accept command
                     let progress_icon = create_progress_icon(&orig_rgba, width, height, p);
                     let _ = tray_icon.set_icon(Some(progress_icon));
                 }
                 IconCommand::Restore => {
+                    anim_mode = AnimMode::Off;
                     let _ = tray_icon.set_icon(Some(icon.clone()));
+                }
+                IconCommand::StartRain => {
+                    // Start rain animation
+                    anim_mode = AnimMode::Rain {
+                        start: Instant::now(),
+                        toggle: false,
+                    };
+                    // Immediately set green icon
+                    let _ = tray_icon.set_icon(Some(green_icon.clone()));
+                }
+                IconCommand::StopRain => {
+                    // Stop rain and set green icon
+                    anim_mode = AnimMode::Off;
+                    let green_icon_local = create_green_icon(&orig_rgba, width, height);
+                    let _ = tray_icon.set_icon(Some(green_icon_local));
+                }
+                IconCommand::Glitch => {
+                    // Start glitch animation
+                    anim_mode = AnimMode::Glitch { toggle: false };
+                    // Immediately set green icon (as base)
+                    let _ = tray_icon.set_icon(Some(green_icon.clone()));
+                }
+                IconCommand::StopGlitch => {
+                    anim_mode = AnimMode::Off;
+                    let _ = tray_icon.set_icon(Some(icon.clone()));
+                }
+                IconCommand::SetGreen => {
+                    let green_icon_local = create_green_icon(&orig_rgba, width, height);
+                    let _ = tray_icon.set_icon(Some(green_icon_local));
+                }
+                IconCommand::SetRainFrame(icon_frame) => {
+                    let _ = tray_icon.set_icon(Some(icon_frame));
+                }
+                IconCommand::SetGlitchFrame(icon_frame) => {
+                    let _ = tray_icon.set_icon(Some(icon_frame));
                 }
             }
         }
 
-        // Process menu events
+        // Update animation frames (no threads)
+        if let AnimMode::Rain { start, toggle } = &mut anim_mode {
+            let elapsed = start.elapsed();
+            if elapsed < Duration::from_secs(5) {
+                // Still within 5 seconds, toggle every 350ms
+                let should_toggle = elapsed.as_millis() % 350 < 175;
+                if should_toggle != *toggle {
+                    *toggle = should_toggle;
+                    let icon_to_use = if should_toggle { green_icon.clone() } else { icon.clone() };
+                    let _ = tray_icon.set_icon(Some(icon_to_use));
+                }
+            } else {
+                // Time's up – stop rain and set green
+                anim_mode = AnimMode::Off;
+                let green_icon_local = create_green_icon(&orig_rgba, width, height);
+                let _ = tray_icon.set_icon(Some(green_icon_local));
+            }
+        }
+        if let AnimMode::Glitch { toggle } = &mut anim_mode {
+            // Glitch is triggered by StopGlitch command, so no auto-stop.
+            // Just toggle every 350ms.
+            let elapsed = Instant::now().elapsed();
+            let should_toggle = elapsed.as_millis() % 700 < 350;
+            if should_toggle != *toggle {
+                *toggle = should_toggle;
+                let icon_to_use = if should_toggle { icon.clone() } else { green_icon.clone() };
+                let _ = tray_icon.set_icon(Some(icon_to_use));
+            }
+        }
+
+        // Process menu events (unchanged)
         while let Ok(menu_event) = menu_event_rx.try_recv() {
             let id = menu_event.id;
 
@@ -1202,7 +1296,7 @@ if ($adapter) {
                     let running = is_running.load(Ordering::SeqCst);
                     if !running {
                         // Immediately change label to Stop
-                        let _ = start_menu_item.set_text(format!("⏹ Stop [{}]", &file_stem));
+                        let _ = start_menu_item.set_text(format!("◼ Stop [{}]", &file_stem));
                         let _ = cmd_tx_main.send(ChildCommand::Start);
                     } else {
                         let _ = cmd_tx_main.send(ChildCommand::Stop);
@@ -1265,7 +1359,6 @@ if ($adapter) {
             } else if id == reload_config_id {
                 log_event("Reload triggered: stopping child and restarting app");
                 let _ = cmd_tx_main.send(ChildCommand::Stop);
-                // std::thread::sleep(TIMEOUT_RELOAD_SLEEP); // commented out
                 std::thread::sleep(Duration::from_secs(2));
                 let exe = std::env::current_exe().expect("failed to get exe path");
                 let args: Vec<String> = std::env::args().collect();
@@ -1370,10 +1463,12 @@ if ($adapter) {
 
     // Final cleanup
     log_event("Main exit: sending stop command and aborting manager");
+    eprintln!("Main exit: sending stop command and aborting manager");
     let _ = cmd_tx.send(ChildCommand::Stop);
     tokio::time::sleep(Duration::from_millis(500)).await;
     manager_handle.abort();
 
     log_event("=== Rust Box terminated ===");
+    eprintln!("=== Rust Box terminated ===");
     Ok(())
 }
