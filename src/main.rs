@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 use std::os::windows::process::CommandExt;
 
 use chrono::Local;
@@ -39,7 +39,6 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 // ===== Logging =====
 fn log_event(msg: &str) {
     use std::io::Write;
-    // Write to log file with timestamp
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(dir) = exe_path.parent() {
             let log_path = dir.join("app.log");
@@ -53,15 +52,13 @@ fn log_event(msg: &str) {
             }
         }
     }
-    // Also print to console
     eprintln!("{}", msg);
 }
 
-/// Create a green version of the original icon (white lines become green).
+// ===== Icon utilities =====
 fn create_green_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
     let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
         .expect("Failed to create RgbaImage");
-
     for y in 0..height {
         for x in 0..width {
             let pixel = img.get_pixel_mut(x, y);
@@ -74,6 +71,27 @@ fn create_green_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon
     }
     let (w, h) = img.dimensions();
     tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create green icon")
+}
+
+fn create_colored_icon(original_rgba: &[u8], width: u32, height: u32, color: Rgba<u8>) -> tray_icon::Icon {
+    let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
+        .expect("Failed to create RgbaImage");
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel_mut(x, y);
+            let [r, g, b, a] = pixel.0;
+            if a == 0 { continue; }
+            if r > 200 && g > 200 && b > 200 {
+                *pixel = color;
+            }
+        }
+    }
+    let (w, h) = img.dimensions();
+    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create colored icon")
+}
+
+fn create_blue_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
+    create_colored_icon(original_rgba, width, height, Rgba([0x42, 0xAA, 0xFF, 255]))
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -116,6 +134,10 @@ enum IconCommand {
     StopRain,
     Glitch,
     StopGlitch,
+    InstallProgress,
+    SetRainFrame(tray_icon::Icon),
+    SetGlitchFrame(tray_icon::Icon),
+    SetInstallFrame(tray_icon::Icon),
 }
 
 // ===== Auto-start via Task Scheduler =====
@@ -480,8 +502,12 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
             if let Some(path) = find_app_binary(app_name) {
                 log_event(&format!("Found binary at: {}", path));
                 return Ok(path);
+            } else if let Some(path) = find_app_by_name(app_name) {
+                log_event(&format!("Found binary via Get-Command: {}", path));
+                return Ok(path);
             } else {
-                log_event(&format!("Binary not found after {} install.", name));
+                log_event(&format!("Binary not found after {} install, aborting.", name));
+                return Err(format!("Binary not found after {} install", name).into());
             }
         } else {
             log_event(&format!("{} failed with non-zero exit code.", name));
@@ -654,7 +680,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Separate clones for different contexts
     let icon_cmd_tx_for_manager = icon_cmd_tx.clone();
     let icon_cmd_tx_gui = icon_cmd_tx.clone();
-    let _icon_cmd_tx_anim = icon_cmd_tx.clone();
 
     let tray_event_rx = TrayIconEvent::receiver();
     let menu_event_rx = MenuEvent::receiver();
@@ -671,8 +696,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let app_path_clone = resolved_app_path.clone();
 
-    // Animation state (no threads)
-    let green_icon = create_green_icon(&orig_rgba, width, height);
+    // Animation threads control
+    let anim_running = Arc::new(AtomicBool::new(false));
+    let anim_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     // --- Manager task ---
     let manager_handle = tokio::spawn(async move {
@@ -1052,15 +1078,20 @@ if ($adapter) {
     let app_installed_flag = Arc::new(AtomicBool::new(app_installed));
     let _app_installed_flag_gui = app_installed_flag.clone();
 
-    // Animation state (no threads)
-    enum AnimMode {
-        Off,
-        Rain { start: Instant, toggle: bool },
-        Glitch { toggle: bool },
-    }
-    let mut anim_mode = AnimMode::Off;
+    // Clones for use inside closure
+    let anim_running_clone = anim_running.clone();
+    let anim_handle_clone = anim_handle.clone();
+
+    // Helper to stop animation thread (defined inside closure to capture clones)
+    let stop_anim = |running: &Arc<AtomicBool>, handle: &Arc<Mutex<Option<std::thread::JoinHandle<()>>>>| {
+        running.store(false, Ordering::SeqCst);
+        if let Some(h) = handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    };
 
     event_loop.run_on_demand(move |_event, window_target| {
+        // Use Wait to avoid CPU hogging – animation is handled by separate threads
         window_target.set_control_flow(ControlFlow::Wait);
 
         // Update Start/Stop button label from manager
@@ -1080,10 +1111,11 @@ if ($adapter) {
                     log_event(&format!("Installation started for {}", app_name));
                     let _ = start_menu_item.set_text(format!("Installing [{}]...", app_name));
                     let _ = start_menu_item.set_enabled(false);
-                    // No progress animation – we use Rain animation for start/stop only
+                    let _ = icon_cmd_tx_gui.send(IconCommand::InstallProgress);
                 }
                 InstallStatus::Installed { path, app_name } => {
                     log_event(&format!("Installation completed: {} at {}", app_name, path));
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
                     let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
                     let _ = start_menu_item.set_text(format!("▶ Start [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
@@ -1094,6 +1126,7 @@ if ($adapter) {
                 }
                 InstallStatus::Failed { app_name, error } => {
                     log_event(&format!("Installation failed for {}: {}", app_name, error));
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
                     let _ = icon_cmd_tx_gui.send(IconCommand::Restore);
                     let _ = start_menu_item.set_text(format!("⤵ Install [{}]", app_name));
                     let _ = start_menu_item.set_enabled(true);
@@ -1106,64 +1139,91 @@ if ($adapter) {
         while let Ok(cmd) = icon_cmd_rx.try_recv() {
             match cmd {
                 IconCommand::Restore => {
-                    anim_mode = AnimMode::Off;
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
                     let _ = tray_icon.set_icon(Some(icon.clone()));
                 }
                 IconCommand::StartRain => {
-                    // Start rain animation
-                    anim_mode = AnimMode::Rain {
-                        start: Instant::now(),
-                        toggle: false,
-                    };
-                    // Immediately set green icon
-                    let _ = tray_icon.set_icon(Some(green_icon.clone()));
+                    // Stop previous animation
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
+                    anim_running_clone.store(true, Ordering::SeqCst);
+                    let running = anim_running_clone.clone();
+                    let cmd_tx = icon_cmd_tx_gui.clone();
+                    let orig_rgba_local = orig_rgba.clone();
+                    let w = width;
+                    let h = height;
+                    let handle = std::thread::spawn(move || {
+                        let mut toggle = false;
+                        let green_icon = create_green_icon(&orig_rgba_local, w, h);
+                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local.clone(), w, h).unwrap();
+                        while running.load(Ordering::SeqCst) {
+                            let icon_to_send = if toggle { original_icon.clone() } else { green_icon.clone() };
+                            let _ = cmd_tx.send(IconCommand::SetRainFrame(icon_to_send));
+                            toggle = !toggle;
+                            std::thread::sleep(Duration::from_millis(350));
+                        }
+                    });
+                    *anim_handle_clone.lock().unwrap() = Some(handle);
                 }
                 IconCommand::StopRain => {
-                    // Stop rain and set green icon
-                    anim_mode = AnimMode::Off;
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
                     let green_icon_local = create_green_icon(&orig_rgba, width, height);
                     let _ = tray_icon.set_icon(Some(green_icon_local));
                 }
                 IconCommand::Glitch => {
-                    // Start glitch animation
-                    anim_mode = AnimMode::Glitch { toggle: false };
-                    // Immediately set green icon (as base)
-                    let _ = tray_icon.set_icon(Some(green_icon.clone()));
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
+                    anim_running_clone.store(true, Ordering::SeqCst);
+                    let running = anim_running_clone.clone();
+                    let cmd_tx = icon_cmd_tx_gui.clone();
+                    let orig_rgba_local = orig_rgba.clone();
+                    let w = width;
+                    let h = height;
+                    let handle = std::thread::spawn(move || {
+                        let mut toggle = false;
+                        let green_icon = create_green_icon(&orig_rgba_local, w, h);
+                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local.clone(), w, h).unwrap();
+                        while running.load(Ordering::SeqCst) {
+                            let icon_to_send = if toggle { original_icon.clone() } else { green_icon.clone() };
+                            let _ = cmd_tx.send(IconCommand::SetGlitchFrame(icon_to_send));
+                            toggle = !toggle;
+                            std::thread::sleep(Duration::from_millis(350));
+                        }
+                    });
+                    *anim_handle_clone.lock().unwrap() = Some(handle);
                 }
                 IconCommand::StopGlitch => {
-                    anim_mode = AnimMode::Off;
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
                     let _ = tray_icon.set_icon(Some(icon.clone()));
                 }
-            }
-        }
-
-        // Update animation frames (no threads)
-        if let AnimMode::Rain { start, toggle } = &mut anim_mode {
-            let elapsed = start.elapsed();
-            if elapsed < Duration::from_secs(5) {
-                // Still within 5 seconds, toggle every 350ms
-                let should_toggle = elapsed.as_millis() % 350 < 175;
-                if should_toggle != *toggle {
-                    *toggle = should_toggle;
-                    let icon_to_use = if should_toggle { green_icon.clone() } else { icon.clone() };
-                    let _ = tray_icon.set_icon(Some(icon_to_use));
+                IconCommand::InstallProgress => {
+                    stop_anim(&anim_running_clone, &anim_handle_clone);
+                    anim_running_clone.store(true, Ordering::SeqCst);
+                    let running = anim_running_clone.clone();
+                    let cmd_tx = icon_cmd_tx_gui.clone();
+                    let orig_rgba_local = orig_rgba.clone();
+                    let w = width;
+                    let h = height;
+                    let handle = std::thread::spawn(move || {
+                        let mut toggle = false;
+                        let blue_icon = create_blue_icon(&orig_rgba_local, w, h);
+                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local.clone(), w, h).unwrap();
+                        while running.load(Ordering::SeqCst) {
+                            let icon_to_send = if toggle { original_icon.clone() } else { blue_icon.clone() };
+                            let _ = cmd_tx.send(IconCommand::SetInstallFrame(icon_to_send));
+                            toggle = !toggle;
+                            std::thread::sleep(Duration::from_millis(350));
+                        }
+                    });
+                    *anim_handle_clone.lock().unwrap() = Some(handle);
                 }
-            } else {
-                // Time's up – stop rain and set green
-                anim_mode = AnimMode::Off;
-                let green_icon_local = create_green_icon(&orig_rgba, width, height);
-                let _ = tray_icon.set_icon(Some(green_icon_local));
-            }
-        }
-        if let AnimMode::Glitch { toggle } = &mut anim_mode {
-            // Glitch is triggered by StopGlitch command, so no auto-stop.
-            // Just toggle every 350ms.
-            let elapsed = Instant::now().elapsed();
-            let should_toggle = elapsed.as_millis() % 700 < 350;
-            if should_toggle != *toggle {
-                *toggle = should_toggle;
-                let icon_to_use = if should_toggle { icon.clone() } else { green_icon.clone() };
-                let _ = tray_icon.set_icon(Some(icon_to_use));
+                IconCommand::SetRainFrame(icon_frame) => {
+                    let _ = tray_icon.set_icon(Some(icon_frame));
+                }
+                IconCommand::SetGlitchFrame(icon_frame) => {
+                    let _ = tray_icon.set_icon(Some(icon_frame));
+                }
+                IconCommand::SetInstallFrame(icon_frame) => {
+                    let _ = tray_icon.set_icon(Some(icon_frame));
+                }
             }
         }
 
@@ -1175,19 +1235,16 @@ if ($adapter) {
                 let installed = app_installed_flag.load(Ordering::SeqCst);
                 let cfg_exists = Path::new(&*cfg_path_for_gui.lock().unwrap()).exists();
                 if !installed {
-                    // Install
                     let _ = cmd_tx_main.send(ChildCommand::Install);
                 } else if installed && cfg_exists {
                     let running = is_running.load(Ordering::SeqCst);
                     if !running {
-                        // Immediately change label to Stop
                         let _ = start_menu_item.set_text(format!("◼ Stop [{}]", &file_stem));
                         let _ = cmd_tx_main.send(ChildCommand::Start);
                     } else {
                         let _ = cmd_tx_main.send(ChildCommand::Stop);
                     }
                 } else {
-                    // installed but no config
                     let msg = "Application installed, but config file missing. Please select config.";
                     log_event(msg);
                     #[cfg(windows)]
@@ -1322,7 +1379,6 @@ if ($adapter) {
                             MB_YESNO | MB_ICONQUESTION,
                         );
                         if result == 6 {
-                            // Reset attempts and send AutoStart again
                             let _ = cmd_tx_main_clone.send(ChildCommand::AutoStart);
                         }
                     }
@@ -1341,6 +1397,10 @@ if ($adapter) {
     })?;
 
     // Final cleanup
+    anim_running.store(false, Ordering::SeqCst);
+    if let Some(h) = anim_handle.lock().unwrap().take() {
+        let _ = h.join();
+    }
     log_event("Main exit: sending stop command and aborting manager");
     let _ = cmd_tx.send(ChildCommand::Stop);
     tokio::time::sleep(Duration::from_millis(500)).await;
