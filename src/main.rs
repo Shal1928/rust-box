@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration};
+use std::time::{Duration, Instant};
 use std::os::windows::process::CommandExt;
 
 use chrono::Local;
@@ -55,6 +55,30 @@ fn log_event(msg: &str) {
     eprintln!("{}", msg);
 }
 
+// ===== Timing logging helper =====
+struct Timer {
+    name: String,
+    start: Instant,
+}
+
+impl Timer {
+    fn new(name: &str) -> Self {
+        let start = Instant::now();
+        log_event(&format!("⏱️ {} START", name));
+        Self { name: name.to_string(), start }
+    }
+
+    fn log(&self, step: &str) {
+        let elapsed = self.start.elapsed();
+        log_event(&format!("⏱️ {}: {} at {:.3}ms", self.name, step, elapsed.as_secs_f64() * 1000.0));
+    }
+
+    fn finish(self) {
+        let elapsed = self.start.elapsed();
+        log_event(&format!("⏱️ {} FINISH: {:.3}ms", self.name, elapsed.as_secs_f64() * 1000.0));
+    }
+}
+
 // ===== Icon utilities =====
 fn create_green_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
     let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
@@ -92,20 +116,6 @@ fn create_colored_icon(original_rgba: &[u8], width: u32, height: u32, color: Rgb
 
 fn create_blue_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
     create_colored_icon(original_rgba, width, height, Rgba([0x42, 0xAA, 0xFF, 255]))
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok();
-    if let Some(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        stdout.contains(&pid.to_string())
-    } else {
-        false
-    }
 }
 
 enum ChildCommand {
@@ -700,6 +710,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let anim_running = Arc::new(AtomicBool::new(false));
     let anim_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
+    // Helper to stop animation thread
+    let stop_anim = |running: &Arc<AtomicBool>, handle: &Arc<Mutex<Option<std::thread::JoinHandle<()>>>>| {
+        running.store(false, Ordering::SeqCst);
+        if let Some(h) = handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    };
+
+    // Clone for the event loop
+    let anim_running_clone = anim_running.clone();
+    let anim_handle_clone = anim_handle.clone();
+
     // --- Manager task ---
     let manager_handle = tokio::spawn(async move {
         let mut child_pid: Option<u32> = None;
@@ -766,6 +788,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = cmd_tx_clone.send(ChildCommand::Start);
                         }
                         ChildCommand::Start => {
+                            let timer = Timer::new("Start");
+                            timer.log("begin");
+
                             if !std::path::Path::new(&current_app_path).exists() {
                                 log_event(&format!("ERROR: Application not found at: {}", current_app_path));
                                 if !auto_start_pending {
@@ -785,8 +810,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if child_pid.is_none() {
                                 log_event(&format!("Starting child: {} with config {}", current_app_path, current_cfg_path));
 
-                                // Start rain animation (send command to GUI)
+                                // Stop any previous animation
+                                let _ = icon_tx.send(IconCommand::StopRain);
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                                // Start rain animation
                                 let _ = icon_tx.send(IconCommand::StartRain);
+                                timer.log("animation started");
 
                                 // Kill any existing process by name
                                 let _ = Command::new("taskkill")
@@ -794,6 +824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .args(["/F", "/IM", &current_app_name])
                                     .output()
                                     .await;
+                                timer.log("taskkill by name done");
 
                                 // Also kill by PID if we had one
                                 if let Some(pid) = child_pid {
@@ -803,6 +834,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .output()
                                         .await;
                                     child_pid = None;
+                                    timer.log("taskkill by PID done");
                                 }
 
                                 // --- Force remove TUN adapter to release resources completely ---
@@ -829,6 +861,7 @@ if ($adapter) {
                                     let stderr = String::from_utf8_lossy(&out.stderr);
                                     log_event(&format!("Remove output: {} {}", stdout, stderr));
                                 }
+                                timer.log("TUN removal done");
 
                                 let ps_script = format!(
                                     r#"$p = Start-Process -FilePath "{}" -ArgumentList "run","-c","{}" -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ $p.Id }}"#,
@@ -865,6 +898,7 @@ if ($adapter) {
                                         continue;
                                     }
                                 };
+                                timer.log("PowerShell spawned");
 
                                 // Adopt the child into the process group (so it gets killed on main exit)
                                 if let Err(e) = group.adopt(&mut child) {
@@ -881,6 +915,7 @@ if ($adapter) {
                                     let _ = err.read_to_string(&mut stderr).await;
                                 }
                                 let _ = child.wait().await;
+                                timer.log("child output read");
 
                                 if !stderr.is_empty() {
                                     log_event(&format!("PowerShell stderr: {}", stderr));
@@ -890,10 +925,12 @@ if ($adapter) {
                                 log_event(&format!("PowerShell stdout: '{}'", pid_str));
 
                                 if let Ok(pid) = pid_str.parse::<u32>() {
-                                    // Use is_process_alive to verify
-                                    if !is_process_alive(pid) {
-                                        // Process died immediately
+                                    // Use System to verify
+                                    let sys = System::new_all();
+                                    let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
+                                    if !still_running {
                                         log_event(&format!("Child process {} died immediately", pid));
+                                        timer.log("process died immediately");
 
                                         if auto_start_pending {
                                             // Progressive retry: 2, 4, 6, 8, 10 seconds
@@ -906,19 +943,20 @@ if ($adapter) {
                                                     tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                                                     let _ = cmd_tx_retry.send(ChildCommand::Start);
                                                 });
+                                                timer.finish();
                                                 continue;
                                             } else {
-                                                // all attempts exhausted
                                                 auto_start_pending = false;
                                                 auto_start_attempts = 0;
                                                 let dialog_tx_clone = dialog_tx.clone();
                                                 let _ = dialog_tx_clone.send(DialogCommand::RetryAutoStart);
+                                                timer.finish();
                                                 continue;
                                             }
                                         } else {
-                                            // normal start, stop rain and restore icon
                                             let _ = icon_tx.send(IconCommand::StopRain);
                                             let _ = gui_tx.send(false);
+                                            timer.finish();
                                             continue;
                                         }
                                     }
@@ -938,9 +976,11 @@ if ($adapter) {
                                         let _ = icon_tx_delayed.send(IconCommand::StopRain);
                                     });
                                     log_event(&format!("Child process started successfully (PID: {})", pid));
+                                    timer.finish();
                                     let _ = gui_tx.send(true);
                                 } else {
                                     log_event(&format!("Failed to parse PID from stdout: '{}'", pid_str));
+                                    timer.log("PID parse failed");
                                     if auto_start_pending {
                                         let delay_secs = 2 + (auto_start_attempts * 2);
                                         auto_start_attempts += 1;
@@ -951,27 +991,34 @@ if ($adapter) {
                                                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                                                 let _ = cmd_tx_retry.send(ChildCommand::Start);
                                             });
+                                            timer.finish();
                                             continue;
                                         } else {
                                             auto_start_pending = false;
                                             auto_start_attempts = 0;
                                             let dialog_tx_clone = dialog_tx.clone();
                                             let _ = dialog_tx_clone.send(DialogCommand::RetryAutoStart);
+                                            timer.finish();
                                             continue;
                                         }
                                     } else {
                                         let _ = icon_tx.send(IconCommand::StopRain);
                                         let _ = gui_tx.send(false);
+                                        timer.finish();
                                         continue;
                                     }
                                 }
                             }
                         }
                         ChildCommand::Stop => {
+                            let timer = Timer::new("Stop");
+                            timer.log("begin");
+
                             log_event("Stopping child process...");
 
                             // Start glitch animation
                             let _ = icon_tx.send(IconCommand::Glitch);
+                            timer.log("glitch animation started");
 
                             // Try graceful shutdown first
                             if let Some(pid) = child_pid {
@@ -980,21 +1027,25 @@ if ($adapter) {
                                     .args(["/PID", &pid.to_string()])
                                     .output()
                                     .await;
+                                timer.log("graceful taskkill sent");
                                 // Wait a few seconds for graceful exit
                                 for _ in 0..10 {
                                     tokio::time::sleep(Duration::from_millis(250)).await;
-                                    if !is_process_alive(pid) {
+                                    let sys = System::new_all();
+                                    if !sys.processes().values().any(|p| p.pid().as_u32() == pid) {
                                         break;
                                     }
                                 }
                                 // If still alive, force kill
-                                if is_process_alive(pid) {
+                                let sys = System::new_all();
+                                if sys.processes().values().any(|p| p.pid().as_u32() == pid) {
                                     let _ = Command::new("taskkill")
                                         .creation_flags(CREATE_NO_WINDOW)
                                         .args(["/F", "/PID", &pid.to_string()])
                                         .output()
                                         .await;
                                     tokio::time::sleep(Duration::from_secs(1)).await;
+                                    timer.log("force kill done");
                                 }
                             }
 
@@ -1002,10 +1053,12 @@ if ($adapter) {
                             if let Some(group) = process_group.take() {
                                 drop(group);
                                 log_event("ProcessGroup dropped");
+                                timer.log("ProcessGroup dropped");
                             }
                             if let Some(mut child) = child_handle.take() {
                                 let _ = child.kill().await;
                                 let _ = child.wait().await;
+                                timer.log("child killed");
                             }
 
                             // Kill by name as fallback
@@ -1015,15 +1068,18 @@ if ($adapter) {
                                 .args(["/F", "/IM", &current_app_name])
                                 .output()
                                 .await;
+                            timer.log("kill by name done");
 
                             // Wait for process to fully terminate
                             if let Some(pid) = child_pid {
                                 for _ in 0..15 {
                                     tokio::time::sleep(Duration::from_millis(100)).await;
                                     let sys = System::new_all();
-                                    let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
-                                    if !still_running { break; }
+                                    if !sys.processes().values().any(|p| p.pid().as_u32() == pid) {
+                                        break;
+                                    }
                                 }
+                                timer.log("termination wait done");
                             }
 
                             child_pid = None;
@@ -1031,7 +1087,9 @@ if ($adapter) {
                             dialog_shown = false;
                             // Stop glitch and restore default icon
                             let _ = icon_tx.send(IconCommand::StopGlitch);
+                            timer.log("glitch stopped");
                             log_event("Child process stopped.");
+                            timer.finish();
                             let _ = gui_tx.send(false);
                         }
                     }
@@ -1078,20 +1136,7 @@ if ($adapter) {
     let app_installed_flag = Arc::new(AtomicBool::new(app_installed));
     let _app_installed_flag_gui = app_installed_flag.clone();
 
-    // Clones for use inside closure
-    let anim_running_clone = anim_running.clone();
-    let anim_handle_clone = anim_handle.clone();
-
-    // Helper to stop animation thread (defined inside closure to capture clones)
-    let stop_anim = |running: &Arc<AtomicBool>, handle: &Arc<Mutex<Option<std::thread::JoinHandle<()>>>>| {
-        running.store(false, Ordering::SeqCst);
-        if let Some(h) = handle.lock().unwrap().take() {
-            let _ = h.join();
-        }
-    };
-
     event_loop.run_on_demand(move |_event, window_target| {
-        // Use Wait to avoid CPU hogging – animation is handled by separate threads
         window_target.set_control_flow(ControlFlow::Wait);
 
         // Update Start/Stop button label from manager
@@ -1143,7 +1188,6 @@ if ($adapter) {
                     let _ = tray_icon.set_icon(Some(icon.clone()));
                 }
                 IconCommand::StartRain => {
-                    // Stop previous animation
                     stop_anim(&anim_running_clone, &anim_handle_clone);
                     anim_running_clone.store(true, Ordering::SeqCst);
                     let running = anim_running_clone.clone();
@@ -1397,10 +1441,7 @@ if ($adapter) {
     })?;
 
     // Final cleanup
-    anim_running.store(false, Ordering::SeqCst);
-    if let Some(h) = anim_handle.lock().unwrap().take() {
-        let _ = h.join();
-    }
+    stop_anim(&anim_running, &anim_handle);
     log_event("Main exit: sending stop command and aborting manager");
     let _ = cmd_tx.send(ChildCommand::Stop);
     tokio::time::sleep(Duration::from_millis(500)).await;
