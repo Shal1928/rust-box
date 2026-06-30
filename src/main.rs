@@ -531,7 +531,6 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
 // ===== Main entry point =====
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Write an empty line to separate log sessions (without timestamp)
     {
         use std::io::Write;
         if let Ok(exe_path) = std::env::current_exe() {
@@ -551,7 +550,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid = std::process::id();
     log_event(&format!("=== Rust Box started (PID: {}) ===", pid));
 
-    // --- Set current directory to the executable's directory (release only) ---
     if cfg!(not(debug_assertions)) {
         if let Some(exe_dir) = std::env::current_exe()
             .ok()
@@ -600,7 +598,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .output()
         .await;
 
-    // Load tray icon
     let icon_bytes = include_bytes!("../rust-box.png");
     let img = ImageReader::new(Cursor::new(icon_bytes))
         .with_guessed_format()?
@@ -619,7 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log_event(&format!("Startup state: app_installed={}, cfg_exists={}", app_installed, cfg_exists));
 
-    // Menu items with emojis
+    // === MENU ===
     let start_menu_item = MenuItem::new(
         if app_installed && cfg_exists {
             format!("▶ Start [{}]", &file_stem)
@@ -631,15 +628,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         true,
         None,
     );
+
     let config_app_item = MenuItem::new(
-        if cfg_exists {
-            format!("Open json [{}]", &file_stem)
-        } else {
-            "Select json file".to_string()
-        },
+        "Select config",
         true,
         None,
     );
+
     let autostart_initial = get_autostart_state();
     let autostart_item = MenuItem::new(
         if autostart_initial {
@@ -650,15 +645,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_installed,
         None,
     );
-    let config_rustbox_item = MenuItem::new("Config", true, None);
-    let reload_config_item = MenuItem::new("Reload", true, None);
+
     let quit_item = MenuItem::new("Exit", true, None);
 
     let start_menu_id = start_menu_item.id().clone();
     let autostart_id = autostart_item.id().clone();
-    let config_rustbox_id = config_rustbox_item.id().clone();
     let config_app_id = config_app_item.id().clone();
-    let reload_config_id = reload_config_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     let menu = Menu::new();
@@ -666,9 +658,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&config_app_item)?;
     menu.append(&autostart_item)?;
-    // menu.append(&PredefinedMenuItem::separator())?;
-    // menu.append(&config_rustbox_item)?;
-    // menu.append(&reload_config_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
@@ -687,14 +676,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dialog_tx, mut dialog_rx) = mpsc::unbounded_channel::<DialogCommand>();
     let (icon_cmd_tx, mut icon_cmd_rx) = mpsc::unbounded_channel::<IconCommand>();
 
-    // Separate clones for different contexts
     let icon_cmd_tx_for_manager = icon_cmd_tx.clone();
     let icon_cmd_tx_gui = icon_cmd_tx.clone();
 
     let tray_event_rx = TrayIconEvent::receiver();
     let menu_event_rx = MenuEvent::receiver();
 
-    // Clones for manager
     let cmd_tx_clone = cmd_tx.clone();
     let install_tx_clone = install_tx.clone();
     let cfg_path_clone_manager = cfg_path.clone();
@@ -706,11 +693,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let app_path_clone = resolved_app_path.clone();
 
-    // Animation threads control
     let anim_running = Arc::new(AtomicBool::new(false));
     let anim_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
-    // Helper to stop animation thread
     let stop_anim = |running: &Arc<AtomicBool>, handle: &Arc<Mutex<Option<std::thread::JoinHandle<()>>>>| {
         running.store(false, Ordering::SeqCst);
         if let Some(h) = handle.lock().unwrap().take() {
@@ -718,7 +703,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Clone for the event loop
     let anim_running_clone = anim_running.clone();
     let anim_handle_clone = anim_handle.clone();
 
@@ -734,7 +718,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut auto_start_attempts = 0;
         let mut auto_start_pending = false;
 
-        // Clone for use inside loop
         let icon_tx = icon_cmd_tx_for_manager.clone();
 
         loop {
@@ -810,15 +793,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if child_pid.is_none() {
                                 log_event(&format!("Starting child: {} with config {}", current_app_path, current_cfg_path));
 
-                                // Stop any previous animation
                                 let _ = icon_tx.send(IconCommand::StopRain);
                                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                                // Start rain animation
                                 let _ = icon_tx.send(IconCommand::StartRain);
                                 timer.log("animation started");
 
-                                // Kill any existing process by name
                                 let _ = Command::new("taskkill")
                                     .creation_flags(CREATE_NO_WINDOW)
                                     .args(["/F", "/IM", &current_app_name])
@@ -826,7 +806,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .await;
                                 timer.log("taskkill by name done");
 
-                                // Also kill by PID if we had one
                                 if let Some(pid) = child_pid {
                                     let _ = Command::new("taskkill")
                                         .creation_flags(CREATE_NO_WINDOW)
@@ -837,7 +816,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     timer.log("taskkill by PID done");
                                 }
 
-                                // --- Force remove TUN adapter to release resources completely ---
                                 log_event("Removing TUN adapter...");
                                 let remove_script = r#"
 $adapter = Get-NetAdapter | Where-Object { $_.Name -like "*tun*" -or $_.Name -like "*sing*" -or $_.Name -like "*wintun*" }
@@ -869,7 +847,6 @@ if ($adapter) {
                                 );
                                 log_event(&format!("Launching: {} with config: {}", current_app_path, current_cfg_path));
 
-                                // Create a process group to ensure termination
                                 let group = match ProcessGroup::new() {
                                     Ok(g) => g,
                                     Err(e) => {
@@ -881,7 +858,6 @@ if ($adapter) {
                                     }
                                 };
 
-                                // Use tokio::process::Command with CREATE_NO_WINDOW flag
                                 let mut cmd = Command::new("powershell");
                                 cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
                                     .stdout(std::process::Stdio::piped())
@@ -900,10 +876,8 @@ if ($adapter) {
                                 };
                                 timer.log("PowerShell spawned");
 
-                                // Adopt the child into the process group (so it gets killed on main exit)
                                 if let Err(e) = group.adopt(&mut child) {
                                     log_event(&format!("Failed to adopt child into group: {}", e));
-                                    // Continue anyway – process is still running
                                 }
 
                                 let mut stdout = String::new();
@@ -925,7 +899,6 @@ if ($adapter) {
                                 log_event(&format!("PowerShell stdout: '{}'", pid_str));
 
                                 if let Ok(pid) = pid_str.parse::<u32>() {
-                                    // Use System to verify
                                     let sys = System::new_all();
                                     let still_running = sys.processes().values().any(|p| p.pid().as_u32() == pid);
                                     if !still_running {
@@ -933,7 +906,6 @@ if ($adapter) {
                                         timer.log("process died immediately");
 
                                         if auto_start_pending {
-                                            // Progressive retry: 2, 4, 6, 8, 10 seconds
                                             let delay_secs = 2 + (auto_start_attempts * 2);
                                             auto_start_attempts += 1;
                                             if auto_start_attempts < 5 {
@@ -961,7 +933,6 @@ if ($adapter) {
                                         }
                                     }
 
-                                    // Successfully started
                                     child_pid = Some(pid);
                                     process_group = Some(group);
                                     child_handle = Some(child);
@@ -969,7 +940,6 @@ if ($adapter) {
                                     dialog_shown = false;
                                     auto_start_pending = false;
                                     auto_start_attempts = 0;
-                                    // Wait 5 seconds before stopping rain animation
                                     let icon_tx_delayed = icon_tx.clone();
                                     tokio::spawn(async move {
                                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1016,11 +986,9 @@ if ($adapter) {
 
                             log_event("Stopping child process...");
 
-                            // Start glitch animation
                             let _ = icon_tx.send(IconCommand::Glitch);
                             timer.log("glitch animation started");
 
-                            // Try graceful shutdown first
                             if let Some(pid) = child_pid {
                                 let _ = Command::new("taskkill")
                                     .creation_flags(CREATE_NO_WINDOW)
@@ -1028,7 +996,6 @@ if ($adapter) {
                                     .output()
                                     .await;
                                 timer.log("graceful taskkill sent");
-                                // Wait a few seconds for graceful exit
                                 for _ in 0..10 {
                                     tokio::time::sleep(Duration::from_millis(250)).await;
                                     let sys = System::new_all();
@@ -1036,7 +1003,6 @@ if ($adapter) {
                                         break;
                                     }
                                 }
-                                // If still alive, force kill
                                 let sys = System::new_all();
                                 if sys.processes().values().any(|p| p.pid().as_u32() == pid) {
                                     let _ = Command::new("taskkill")
@@ -1049,7 +1015,6 @@ if ($adapter) {
                                 }
                             }
 
-                            // Also kill via process group
                             if let Some(group) = process_group.take() {
                                 drop(group);
                                 log_event("ProcessGroup dropped");
@@ -1061,7 +1026,6 @@ if ($adapter) {
                                 timer.log("child killed");
                             }
 
-                            // Kill by name as fallback
                             log_event(&format!("Stop: killing all {} processes", current_app_name));
                             let _ = Command::new("taskkill")
                                 .creation_flags(CREATE_NO_WINDOW)
@@ -1070,7 +1034,6 @@ if ($adapter) {
                                 .await;
                             timer.log("kill by name done");
 
-                            // Wait for process to fully terminate
                             if let Some(pid) = child_pid {
                                 for _ in 0..15 {
                                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1085,7 +1048,6 @@ if ($adapter) {
                             child_pid = None;
                             is_running_task.store(false, Ordering::SeqCst);
                             dialog_shown = false;
-                            // Stop glitch and restore default icon
                             let _ = icon_tx.send(IconCommand::StopGlitch);
                             timer.log("glitch stopped");
                             log_event("Child process stopped.");
@@ -1106,7 +1068,6 @@ if ($adapter) {
                             is_running_task.store(false, Ordering::SeqCst);
                             let _ = gui_tx.send(false);
 
-                            // Give system a moment to release resources before showing dialog
                             tokio::time::sleep(Duration::from_secs(1)).await;
 
                             if !dialog_shown {
@@ -1129,17 +1090,14 @@ if ($adapter) {
         let _ = cmd_tx.send(ChildCommand::AutoStart);
     }
 
-    // --- GUI event loop ---
     let mut event_loop = EventLoop::new()?;
     let cmd_tx_main = cmd_tx.clone();
     let cmd_tx_main_clone = cmd_tx_main.clone();
     let app_installed_flag = Arc::new(AtomicBool::new(app_installed));
-    let _app_installed_flag_gui = app_installed_flag.clone();
 
     event_loop.run_on_demand(move |_event, window_target| {
         window_target.set_control_flow(ControlFlow::Wait);
 
-        // Update Start/Stop button label from manager
         while let Ok(running) = gui_rx.try_recv() {
             let text = if running {
                 format!("◼ Stop [{}]", &file_stem)
@@ -1149,7 +1107,6 @@ if ($adapter) {
             let _ = start_menu_item.set_text(text);
         }
 
-        // Handle installation status updates
         while let Ok(status) = install_rx.try_recv() {
             match status {
                 InstallStatus::Installing { app_name } => {
@@ -1180,7 +1137,6 @@ if ($adapter) {
             }
         }
 
-        // Handle icon commands
         while let Ok(cmd) = icon_cmd_rx.try_recv() {
             match cmd {
                 IconCommand::Restore => {
@@ -1271,7 +1227,7 @@ if ($adapter) {
             }
         }
 
-        // Process menu events (unchanged)
+        // Process menu events
         while let Ok(menu_event) = menu_event_rx.try_recv() {
             let id = menu_event.id;
 
@@ -1333,60 +1289,44 @@ if ($adapter) {
                         }
                     }
                 }
-            } else if id == config_rustbox_id {
-                log_event("Opening rust-box config in Notepad");
-                let _ = std::process::Command::new("notepad")
-                    .arg(&"rust-box.cfg")
-                    .spawn();
-            } else if id == reload_config_id {
-                log_event("Reload triggered: stopping child and restarting app");
-                let _ = cmd_tx_main.send(ChildCommand::Stop);
-                std::thread::sleep(Duration::from_secs(2));
-                let exe = std::env::current_exe().expect("failed to get exe path");
-                let args: Vec<String> = std::env::args().collect();
-                let _ = std::process::Command::new(exe)
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .args(&args[1..])
-                    .spawn();
-                window_target.exit();
             } else if id == config_app_id {
-                let current_cfg = cfg_path_for_gui.lock().unwrap().clone();
-                let cfg_exists = Path::new(&current_cfg).exists();
-                if cfg_exists {
-                    log_event(&format!("Opening json config in Notepad: {}", current_cfg));
-                    let _ = std::process::Command::new("notepad")
-                        .arg(&current_cfg)
-                        .spawn();
-                } else {
-                    log_event("Config file not found, showing file dialog");
-                    if let Some(selected) = show_config_file_dialog() {
-                        log_event(&format!("User selected config file: {}", selected));
-                        if let Err(e) = Config::update_cfg_path(&selected) {
-                            log_event(&format!("Failed to update cfg_path: {}", e));
-                            #[cfg(windows)]
-                            unsafe {
-                                let msg_utf16: Vec<u16> = e.to_string().encode_utf16().chain(Some(0)).collect();
-                                let title = "Rust Box - Error";
-                                let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-                                MessageBoxW(
-                                    null_mut(),
-                                    msg_utf16.as_ptr(),
-                                    title_utf16.as_ptr(),
-                                    MB_OK | MB_ICONERROR,
-                                );
-                            }
-                        } else {
-                            log_event(&format!("Config path updated to: {}", selected));
-                            *cfg_path_for_gui.lock().unwrap() = selected.clone();
-                            let _ = config_app_item.set_text(format!("Open json [{}]", &file_stem));
-                            if app_installed_flag.load(Ordering::SeqCst) {
-                                let _ = start_menu_item.set_enabled(true);
-                            }
-                            let _ = cmd_tx_main.send(ChildCommand::UpdateConfigPath(selected));
+                log_event("Opening config file dialog");
+                if let Some(selected) = show_config_file_dialog() {
+                    log_event(&format!("User selected config file: {}", selected));
+                    if let Err(e) = Config::update_cfg_path(&selected) {
+                        log_event(&format!("Failed to update cfg_path: {}", e));
+                        #[cfg(windows)]
+                        unsafe {
+                            let msg_utf16: Vec<u16> = e.to_string().encode_utf16().chain(Some(0)).collect();
+                            let title = "Rust Box - Error";
+                            let title_utf16: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+                            MessageBoxW(
+                                null_mut(),
+                                msg_utf16.as_ptr(),
+                                title_utf16.as_ptr(),
+                                MB_OK | MB_ICONERROR,
+                            );
                         }
                     } else {
-                        log_event("User cancelled file selection");
+                        log_event(&format!("Config path updated to: {}", selected));
+                        *cfg_path_for_gui.lock().unwrap() = selected.clone();
+                        // Уведомляем менеджер о новом пути
+                        let _ = cmd_tx_main.send(ChildCommand::UpdateConfigPath(selected));
+
+                        // Если приложение установлено и конфиг существует, перезапускаем процесс
+                        let installed = app_installed_flag.load(Ordering::SeqCst);
+                        let cfg_exists = Path::new(&*cfg_path_for_gui.lock().unwrap()).exists();
+                        if installed && cfg_exists {
+                            // Останавливаем текущий процесс, если он запущен
+                            if is_running.load(Ordering::SeqCst) {
+                                let _ = cmd_tx_main.send(ChildCommand::Stop);
+                            }
+                            // Запускаем с новым конфигом
+                            let _ = cmd_tx_main.send(ChildCommand::Start);
+                        }
                     }
+                } else {
+                    log_event("User cancelled file selection");
                 }
             } else if id == quit_id {
                 log_event("Quit requested, stopping child and exiting");
@@ -1396,7 +1336,6 @@ if ($adapter) {
             }
         }
 
-        // Handle dialog responses (restart or exit)
         while let Ok(dialog_cmd) = dialog_rx.try_recv() {
             match dialog_cmd {
                 DialogCommand::Restart => {
@@ -1430,7 +1369,6 @@ if ($adapter) {
             }
         }
 
-        // Left-click on tray icon shows the menu
         while let Ok(tray_event) = tray_event_rx.try_recv() {
             if let TrayIconEvent::Click { button, .. } = tray_event {
                 if button == tray_icon::MouseButton::Left {
@@ -1440,7 +1378,6 @@ if ($adapter) {
         }
     })?;
 
-    // Final cleanup
     stop_anim(&anim_running, &anim_handle);
     log_event("Main exit: sending stop command and aborting manager");
     let _ = cmd_tx.send(ChildCommand::Stop);
