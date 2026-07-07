@@ -1,6 +1,10 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod logger;
+
+use crate::config::Config;
+use crate::logger::{log_event, Timer};
 
 use std::env;
 use std::io::Cursor;
@@ -10,10 +14,9 @@ use std::process::Stdio;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 use std::os::windows::process::CommandExt;
 
-use chrono::Local;
 use image::{ImageReader, RgbaImage, Rgba};
 use processkit::ProcessGroup;
 use sysinfo::System;
@@ -32,52 +35,8 @@ use winapi::um::winuser::{MessageBoxW, MB_DEFBUTTON1, MB_ICONERROR, MB_OK, MB_YE
 
 use rfd::FileDialog;
 use winapi::um::winuser::MB_ICONQUESTION;
-use crate::config::Config;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-// ===== Logging =====
-fn log_event(msg: &str) {
-    use std::io::Write;
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            let log_path = dir.join("app.log");
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                let _ = writeln!(file, "[{}] {}", timestamp, msg);
-            }
-        }
-    }
-    eprintln!("{}", msg);
-}
-
-// ===== Timing logging helper =====
-struct Timer {
-    name: String,
-    start: Instant,
-}
-
-impl Timer {
-    fn new(name: &str) -> Self {
-        let start = Instant::now();
-        log_event(&format!("⏱️ {} START", name));
-        Self { name: name.to_string(), start }
-    }
-
-    fn log(&self, step: &str) {
-        let elapsed = self.start.elapsed();
-        log_event(&format!("⏱️ {}: {} at {:.3}ms", self.name, step, elapsed.as_secs_f64() * 1000.0));
-    }
-
-    fn finish(self) {
-        let elapsed = self.start.elapsed();
-        log_event(&format!("⏱️ {} FINISH: {:.3}ms", self.name, elapsed.as_secs_f64() * 1000.0));
-    }
-}
 
 // ===== Icon utilities =====
 fn create_green_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
