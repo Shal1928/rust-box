@@ -2,12 +2,13 @@
 
 mod config;
 mod logger;
+mod icore;
 
 use crate::config::Config;
 use crate::logger::{log_event, Timer};
+use crate::icore::{IcoMgr};
 
 use std::env;
-use std::io::Cursor;
 use std::path::Path;
 use std::process;
 use std::process::Stdio;
@@ -17,7 +18,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration};
 use std::os::windows::process::CommandExt;
 
-use image::{ImageReader, RgbaImage, Rgba};
 use processkit::ProcessGroup;
 use sysinfo::System;
 use tokio::io::AsyncReadExt;
@@ -31,51 +31,13 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 
 #[cfg(windows)]
-use winapi::um::winuser::{MessageBoxW, MB_DEFBUTTON1, MB_ICONERROR, MB_OK, MB_YESNO};
+use winapi::um::winuser::{
+    MessageBoxW, MB_DEFBUTTON1, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO,
+};
 
 use rfd::FileDialog;
-use winapi::um::winuser::MB_ICONQUESTION;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-// ===== Icon utilities =====
-fn create_green_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
-    let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
-        .expect("Failed to create RgbaImage");
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = img.get_pixel_mut(x, y);
-            let [r, g, b, a] = pixel.0;
-            if a == 0 { continue; }
-            if r > 200 && g > 200 && b > 200 {
-                *pixel = Rgba([0, 255, 0, a]);
-            }
-        }
-    }
-    let (w, h) = img.dimensions();
-    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create green icon")
-}
-
-fn create_colored_icon(original_rgba: &[u8], width: u32, height: u32, color: Rgba<u8>) -> tray_icon::Icon {
-    let mut img = RgbaImage::from_raw(width, height, original_rgba.to_vec())
-        .expect("Failed to create RgbaImage");
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = img.get_pixel_mut(x, y);
-            let [r, g, b, a] = pixel.0;
-            if a == 0 { continue; }
-            if r > 200 && g > 200 && b > 200 {
-                *pixel = color;
-            }
-        }
-    }
-    let (w, h) = img.dimensions();
-    tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("Failed to create colored icon")
-}
-
-fn create_blue_icon(original_rgba: &[u8], width: u32, height: u32) -> tray_icon::Icon {
-    create_colored_icon(original_rgba, width, height, Rgba([0x42, 0xAA, 0xFF, 255]))
-}
 
 enum ChildCommand {
     Install,
@@ -113,10 +75,10 @@ enum IconCommand {
 const TASK_NAME: &str = "RustBox";
 
 fn get_username() -> String {
-    if let Ok(user) = std::env::var("USERNAME") {
+    if let Ok(user) = env::var("USERNAME") {
         return user;
     }
-    let output = std::process::Command::new("whoami")
+    let output = process::Command::new("whoami")
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()
@@ -125,7 +87,7 @@ fn get_username() -> String {
 }
 
 fn get_autostart_state() -> bool {
-    let output = std::process::Command::new("schtasks")
+    let output = process::Command::new("schtasks")
         .creation_flags(CREATE_NO_WINDOW)
         .args(["/query", "/tn", TASK_NAME])
         .output();
@@ -145,7 +107,7 @@ fn set_autostart_state(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
             return Err("Could not determine username for task creation".into());
         }
 
-        let output = std::process::Command::new("schtasks")
+        let output = process::Command::new("schtasks")
             .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "/create",
@@ -170,7 +132,7 @@ fn set_autostart_state(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
         log_event(&format!("Autostart enabled (user {})", username));
     } else {
-        let _ = std::process::Command::new("schtasks")
+        let _ = process::Command::new("schtasks")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["/delete", "/tn", TASK_NAME, "/f"])
             .output();
@@ -209,7 +171,7 @@ fn show_restart_dialog() -> DialogCommand {
 
 // ===== Package managers =====
 fn is_winget_available() -> bool {
-    std::process::Command::new("winget")
+    process::Command::new("winget")
         .creation_flags(CREATE_NO_WINDOW)
         .arg("--version")
         .output()
@@ -218,7 +180,7 @@ fn is_winget_available() -> bool {
 }
 
 fn is_choco_available() -> bool {
-    std::process::Command::new("choco")
+    process::Command::new("choco")
         .creation_flags(CREATE_NO_WINDOW)
         .arg("--version")
         .output()
@@ -227,7 +189,7 @@ fn is_choco_available() -> bool {
 }
 
 fn is_scoop_available() -> bool {
-    std::process::Command::new("scoop")
+    process::Command::new("scoop")
         .creation_flags(CREATE_NO_WINDOW)
         .arg("--version")
         .output()
@@ -241,7 +203,7 @@ fn find_app_by_name(app_name: &str) -> Option<String> {
         "Get-Command {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source",
         app_name
     );
-    let output = std::process::Command::new("powershell")
+    let output = process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps_command])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -249,7 +211,7 @@ fn find_app_by_name(app_name: &str) -> Option<String> {
     if output.status.success() {
         let path = String::from_utf8(output.stdout).ok()?;
         let path = path.trim();
-        if !path.is_empty() && std::path::Path::new(path).exists() {
+        if !path.is_empty() && Path::new(path).exists() {
             return Some(path.to_string());
         }
     }
@@ -259,7 +221,7 @@ fn find_app_by_name(app_name: &str) -> Option<String> {
 fn resolve_app_path(app_path_from_config: &str) -> Option<String> {
     if (app_path_from_config.contains('\\') || app_path_from_config.contains('/'))
         && app_path_from_config.to_lowercase().ends_with(".exe")
-        && std::path::Path::new(app_path_from_config).exists()
+        && Path::new(app_path_from_config).exists()
     {
         return Some(app_path_from_config.to_string());
     }
@@ -282,7 +244,7 @@ fn find_app_binary(app_name: &str) -> Option<String> {
     }
 
     let choco_shim = format!(r"C:\ProgramData\chocolatey\bin\{}.exe", app_name);
-    if std::path::Path::new(&choco_shim).exists() {
+    if Path::new(&choco_shim).exists() {
         return Some(choco_shim);
     }
 
@@ -298,7 +260,7 @@ fn find_app_binary(app_name: &str) -> Option<String> {
         }
     }
 
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+    if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
         let winget_base = format!(r"{}\Microsoft\WinGet\Packages", local_app_data);
         if let Ok(entries) = std::fs::read_dir(&winget_base) {
             for entry in entries.filter_map(Result::ok) {
@@ -312,12 +274,12 @@ fn find_app_binary(app_name: &str) -> Option<String> {
         }
     }
 
-    if let Ok(user) = std::env::var("USERNAME") {
+    if let Ok(user) = env::var("USERNAME") {
         let scoop_path = format!(
             r"C:\Users\{}\scoop\apps\{}\current\{}.exe",
             user, app_name, app_name
         );
-        if std::path::Path::new(&scoop_path).exists() {
+        if Path::new(&scoop_path).exists() {
             return Some(scoop_path);
         }
     }
@@ -327,7 +289,7 @@ fn find_app_binary(app_name: &str) -> Option<String> {
         format!(r"C:\Program Files (x86)\{}\{}.exe", app_name, app_name),
     ];
     for path in common_paths.iter() {
-        if std::path::Path::new(path).exists() {
+        if Path::new(path).exists() {
             return Some(path.clone());
         }
     }
@@ -335,7 +297,7 @@ fn find_app_binary(app_name: &str) -> Option<String> {
     None
 }
 
-fn find_exe_recursive(dir: &std::path::Path, app_name: &str) -> Option<String> {
+fn find_exe_recursive(dir: &Path, app_name: &str) -> Option<String> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
@@ -374,7 +336,7 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
 
     log_event(&format!("Has winget: {}, choco: {}, scoop: {}", has_winget, has_choco, has_scoop));
 
-    let methods: Vec<(&str, Box<dyn Fn() -> tokio::process::Command + Send + Sync>)> = vec![
+    let methods: Vec<(&str, Box<dyn Fn() -> Command + Send + Sync>)> = vec![
         (
             "winget",
             Box::new(|| {
@@ -468,16 +430,17 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
 
         if output.status.success() {
             log_event(&format!("{} succeeded, searching for binary...", name));
-            if let Some(path) = find_app_binary(app_name) {
-                log_event(&format!("Found binary at: {}", path));
-                return Ok(path);
-            } else if let Some(path) = find_app_by_name(app_name) {
-                log_event(&format!("Found binary via Get-Command: {}", path));
-                return Ok(path);
-            } else {
-                log_event(&format!("Binary not found after {} install, aborting.", name));
-                return Err(format!("Binary not found after {} install", name).into());
-            }
+            return
+                if let Some(path) = find_app_binary(app_name) {
+                    log_event(&format!("Found binary at: {}", path));
+                    Ok(path)
+                } else if let Some(path) = find_app_by_name(app_name) {
+                    log_event(&format!("Found binary via Get-Command: {}", path));
+                    Ok(path)
+                } else {
+                    log_event(&format!("Binary not found after {} install, aborting.", name));
+                    Err(format!("Binary not found after {} install", name).into())
+                }
         } else {
             log_event(&format!("{} failed with non-zero exit code.", name));
         }
@@ -492,7 +455,7 @@ async fn install_app(app_name: &str) -> Result<String, Box<dyn std::error::Error
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use std::io::Write;
-        if let Ok(exe_path) = std::env::current_exe() {
+        if let Ok(exe_path) = env::current_exe() {
             if let Some(dir) = exe_path.parent() {
                 let log_path = dir.join("app.log");
                 if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -506,15 +469,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let pid = std::process::id();
+    let pid = process::id();
     log_event(&format!("=== Rust Box started (PID: {}) ===", pid));
 
     if cfg!(not(debug_assertions)) {
-        if let Some(exe_dir) = std::env::current_exe()
+        if let Some(exe_dir) = env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {
-            if let Err(e) = std::env::set_current_dir(&exe_dir) {
+            if let Err(e) = env::set_current_dir(&exe_dir) {
                 log_event(&format!("Could not set CWD: {}", e));
             } else {
                 log_event(&format!("CWD set to: {:?}", exe_dir));
@@ -557,14 +520,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .output()
         .await;
 
-    let icon_bytes = include_bytes!("../rust-box.png");
-    let img = ImageReader::new(Cursor::new(icon_bytes))
-        .with_guessed_format()?
-        .decode()?
-        .into_rgba8();
-    let (width, height) = img.dimensions();
-    let orig_rgba = img.into_raw();
-    let icon = tray_icon::Icon::from_rgba(orig_rgba.clone(), width, height)?;
+    let ico_mgr = Arc::new(
+        IcoMgr::from_bytes(include_bytes!("../rust-box.png"))
+            .expect("Failed to include&load ico from path (png)")
+    );
+
+    // Получение исходных данных и создание оригинальной иконки
+    let icon = tray_icon::Icon::from_rgba(
+        ico_mgr.raw_rgba().to_vec(),
+        ico_mgr.width(),
+        ico_mgr.height()
+    ).expect("Failed to create original icon");
+
 
     let is_running = Arc::new(AtomicBool::new(false));
     let is_running_task = is_running.clone();
@@ -733,7 +700,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let timer = Timer::new("Start");
                             timer.log("begin");
 
-                            if !std::path::Path::new(&current_app_path).exists() {
+                            if !Path::new(&current_app_path).exists() {
                                 log_event(&format!("ERROR: Application not found at: {}", current_app_path));
                                 if !auto_start_pending {
                                     let _ = gui_tx.send(false);
@@ -741,7 +708,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
 
-                            if !std::path::Path::new(&current_cfg_path).exists() {
+                            if !Path::new(&current_cfg_path).exists() {
                                 log_event(&format!("ERROR: Config file not found: {}", current_cfg_path));
                                 if !auto_start_pending {
                                     let _ = gui_tx.send(false);
@@ -819,8 +786,8 @@ if ($adapter) {
 
                                 let mut cmd = Command::new("powershell");
                                 cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
-                                    .stdout(std::process::Stdio::piped())
-                                    .stderr(std::process::Stdio::piped())
+                                    .stdout(Stdio::piped())
+                                    .stderr(Stdio::piped())
                                     .creation_flags(CREATE_NO_WINDOW);
 
                                 let mut child = match cmd.spawn() {
@@ -1053,6 +1020,7 @@ if ($adapter) {
     let cmd_tx_main = cmd_tx.clone();
     let cmd_tx_main_clone = cmd_tx_main.clone();
     let app_installed_flag = Arc::new(AtomicBool::new(app_installed));
+    let ico_mgr_for_gui = Arc::clone(&ico_mgr);
 
     event_loop.run_on_demand(move |_event, window_target| {
         window_target.set_control_flow(ControlFlow::Wait);
@@ -1107,13 +1075,14 @@ if ($adapter) {
                     anim_running_clone.store(true, Ordering::SeqCst);
                     let running = anim_running_clone.clone();
                     let cmd_tx = icon_cmd_tx_gui.clone();
-                    let orig_rgba_local = orig_rgba.clone();
-                    let w = width;
-                    let h = height;
+                    let orig_rgba_local = ico_mgr_for_gui.raw_rgba().to_vec();
+                    let green_rgba = ico_mgr_for_gui.green_raw();
+                    let w = ico_mgr_for_gui.width();
+                    let h = ico_mgr_for_gui.height();
                     let handle = std::thread::spawn(move || {
+                        let green_icon = tray_icon::Icon::from_rgba(green_rgba, w, h).expect("green icon");
+                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local, w, h).expect("original icon");
                         let mut toggle = false;
-                        let green_icon = create_green_icon(&orig_rgba_local, w, h);
-                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local.clone(), w, h).unwrap();
                         while running.load(Ordering::SeqCst) {
                             let icon_to_send = if toggle { original_icon.clone() } else { green_icon.clone() };
                             let _ = cmd_tx.send(IconCommand::SetRainFrame(icon_to_send));
@@ -1125,21 +1094,27 @@ if ($adapter) {
                 }
                 IconCommand::StopRain => {
                     stop_anim(&anim_running_clone, &anim_handle_clone);
-                    let green_icon_local = create_green_icon(&orig_rgba, width, height);
-                    let _ = tray_icon.set_icon(Some(green_icon_local));
+                    let _ = tray_icon.set_icon(Some(
+                        tray_icon::Icon::from_rgba(
+                            ico_mgr_for_gui.green_raw(),
+                            ico_mgr_for_gui.width(),
+                            ico_mgr_for_gui.height(),
+                        ).expect("green icon"),
+                    ));
                 }
                 IconCommand::Glitch => {
                     stop_anim(&anim_running_clone, &anim_handle_clone);
                     anim_running_clone.store(true, Ordering::SeqCst);
                     let running = anim_running_clone.clone();
                     let cmd_tx = icon_cmd_tx_gui.clone();
-                    let orig_rgba_local = orig_rgba.clone();
-                    let w = width;
-                    let h = height;
+                    let orig_rgba_local = ico_mgr_for_gui.raw_rgba().to_vec();
+                    let green_rgba = ico_mgr_for_gui.green_raw();
+                    let w = ico_mgr_for_gui.width();
+                    let h = ico_mgr_for_gui.height();
                     let handle = std::thread::spawn(move || {
                         let mut toggle = false;
-                        let green_icon = create_green_icon(&orig_rgba_local, w, h);
-                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local.clone(), w, h).unwrap();
+                        let green_icon = tray_icon::Icon::from_rgba(green_rgba, w, h).expect("green icon");
+                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local, w, h).expect("original icon");
                         while running.load(Ordering::SeqCst) {
                             let icon_to_send = if toggle { original_icon.clone() } else { green_icon.clone() };
                             let _ = cmd_tx.send(IconCommand::SetGlitchFrame(icon_to_send));
@@ -1158,13 +1133,14 @@ if ($adapter) {
                     anim_running_clone.store(true, Ordering::SeqCst);
                     let running = anim_running_clone.clone();
                     let cmd_tx = icon_cmd_tx_gui.clone();
-                    let orig_rgba_local = orig_rgba.clone();
-                    let w = width;
-                    let h = height;
+                    let orig_rgba_local = ico_mgr_for_gui.raw_rgba().to_vec();
+                    let blue_rgba = ico_mgr_for_gui.green_raw();
+                    let w = ico_mgr_for_gui.width();
+                    let h = ico_mgr_for_gui.height();
                     let handle = std::thread::spawn(move || {
                         let mut toggle = false;
-                        let blue_icon = create_blue_icon(&orig_rgba_local, w, h);
-                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local.clone(), w, h).unwrap();
+                        let blue_icon = tray_icon::Icon::from_rgba(blue_rgba, w, h).expect("blue icon");
+                        let original_icon = tray_icon::Icon::from_rgba(orig_rgba_local, w, h).expect("original icon");
                         while running.load(Ordering::SeqCst) {
                             let icon_to_send = if toggle { original_icon.clone() } else { blue_icon.clone() };
                             let _ = cmd_tx.send(IconCommand::SetInstallFrame(icon_to_send));
