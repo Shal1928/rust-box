@@ -2754,6 +2754,7 @@ dependencies = [
  "processkit",
  "rfd",
  "sysinfo",
+ "thiserror 2.0.18",
  "tokio",
  "tray-icon",
  "winapi",

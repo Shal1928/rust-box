@@ -13,9 +13,10 @@ processkit = "0.5"
 rfd = "0.14"
 chrono = "0.4.45"
 base64 = "0.22.1"
+thiserror = "2.0.18"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser"] }
+winapi = { version = "0.3", features = ["winuser", "winbase"] }
 
 [build-dependencies]
 winres = "0.1.12"
